@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 
 our $progname = 'shepherd';
-my $version = '1.9.11';
+my $version = '1.9.12';
 
 # tv_grab_au
 # "Shepherd"
@@ -35,7 +35,7 @@ use lib 'references';
 # --- required perl modules
 # ---------------------------------------------------------------------------
 
-our $wiki = 'http://svn.whuffy.com/wiki';
+our $wiki = 'tba';
 
 &require_module("Cwd");
 &require_module("LWP::UserAgent");
@@ -918,7 +918,7 @@ sub report_stats
     else
     {
 	&log("Posting anonymous usage statistics.\n");
-	return 0 unless (fetch_file("http://www.whuffy.com/report.cgi", undef, 1, $postvars));
+	return 0;
     }
 
     # successful post, clear out our pending messages
@@ -1907,10 +1907,10 @@ sub read_config_file
     {
 	&log("Defining default source.\n");
 	&reset_sources;
-	# Components with no source are assigned to whuffy
+	# Components with no source are assigned to github
 	foreach (keys %$components)
 	{
-	    $components->{$_}->{source} ||= 'http://www.whuffy.com/shepherd/';
+	    $components->{$_}->{source} ||= 'https://raw.githubusercontent.com/perkins1724/shepherd.tv/master/';
 	}
     }
 	
@@ -2326,7 +2326,7 @@ sub delsource
 
 sub reset_sources
 {
-    $sources = [ 'http://www.whuffy.com/shepherd/' ];
+    $sources = [ 'https://raw.githubusercontent.com/perkins1724/shepherd.tv/master/' ];
 }
 
 sub list_chan_names
