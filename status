@@ -8,12 +8,10 @@ grabber         oztivo              2.62
 grabber         yahoo7widget        2.44
 grabber         sbsweb              5.04
 grabber         rex                 10.3.2
-grabber         acctv_website       0.09
-grabber         zaxmltv             0.03
 grabber         foxtel_swf          5.00
 reconciler      reconciler_mk2      0.58
-postprocessor   imdb_augment_data   1.03
-postprocessor   metacritic          1.1
 postprocessor   augment_timezone    0.30
 postprocessor	add_channel_icons   0.2
+postprocessor   tmdb_augment_data  2.5
+postprocessor   ttvdb_augment_data 1.2
 END

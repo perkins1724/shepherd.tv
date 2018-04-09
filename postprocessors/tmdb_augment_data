@@ -1,0 +1,1339 @@
+#!/usr/bin/env perl
+
+# The Movie Database (TMDb) XMLTV data augmenter
+# "This product uses the TMDb API but is not endorsed or certified by TMDb." 
+#
+#  * to be used as a postprocessor for XMLTV data
+#  * uses The Movie Database (https://www.themoviedb.org) to augment TV guide data;
+#  * this should only be used for non-commercial use.
+#  * use of this data augmenter requires an API key which is built in. Misuse of
+#    this data augmenter may result in the API key being blocked. Please act
+#    responsibly.
+#  * TMDb depends on user contributions. If you use this data augmenter please also
+#    consider creating an account at https://www.themoviedb.org and contributing.
+#  * please follow the TMDb terms and conditions.
+#  * can be used in conjunction with 'shepherd' XMLTV reconciler or standalone
+#    (pipe-through)
+#
+#  initial version based mostly on the aged IMDB XMLTV data augmenter
+#
+#  changelog:
+#    0.01 25th Feb 17	initial version
+#    0.02 1st Mar 17	version step
+#    0.03 1st Mar 17	xmltv compliance issues
+#    0.04 2nd Mar 17	further xmltv compliance issues. print recommendations for users
+#			to take back to TMDb.
+#    0.5 3rd Mar 17     version step with move to repo
+#    0.6 5th Mar 17     version step with move to repo
+#    0.7 5th Mar 17     tighten up on ascii characters.
+#    0.8 5th Mar 17     better (more properly) handle encoding. Prior encoding was broken
+#                       testing with shepherd cache instead of CHI.
+#    0.9 6th Mar 17     removed a couple of large debug strings
+#    1.0 6th Mar 17     misc, formatting, title overrides
+#    1.1 7th Mar 17     encode as UTF-8
+#    1.2 7th Mar 17     proof of concept hack to get around malformed encoding
+#    1.3 7th Mar 17     testing fix for encoding
+#    1.4 7th Mar 17     output file encoding
+#    1.5 10th Mar 17    various minor
+#    1.6 11th Mar 17    get imdb value
+#    1.7 13th Mar 17    progressively write cache to help with cache rebuilds
+#    2.0 13th Mar 17    improved handling of failed web requests
+#    2.1 13th Mar 17    internal
+#    2.2 15th Mar 17    encoding
+#    2.3 16th Mar 17    various. encoding
+#    2.4 19th Mar 17    logging. handle additional non iso-8859-1 characters
+#    2.5 21st Mar 17    fixed handling of blank tmdb descriptions
+#
+#  todo:
+#    support lang not just assume en
+#    order the retrieval of people - may be pointless as not sure there is an order to use
+#    see what other useful info we can grab
+
+use strict;
+use warnings;
+
+my $progname = "test_tmdb_augment_data";
+my $version = "2.5";
+
+use Getopt::Long;
+use Encode;
+
+use Data::Dumper;
+use JSON;
+
+### these are new modules
+use XML::Twig;
+
+use Shepherd::Common;
+
+########################################################################
+# initial setup
+########################################################################
+
+my $script_start_time = time;
+my $last_checked = $script_start_time;
+my %stats;
+my $movie_cache;
+my $twig= new XML::Twig( keep_encoding => 1, keep_atts_order => 1);
+my $ua;
+my $API_KEY = "api_key=25a87aab93af558c110f741f2d2fe64a";
+my $program;
+my $fh;
+my $xratelimit_min = 40;
+my ($program_hits, $cache_hits, $website_hits, $programs_updated, $programs_skipped_duration, $programs_skipped_subtitle, $not_program, $programs_skipped_title_override, $program_not_matched) = (0) x 9;
+my @augmentation_list;
+my @augmentation_list_new_title;
+my @rejected_not_sane;
+my @match_not_found;
+
+
+$| = 1;
+
+#
+# parse command line
+#
+
+my $opt = { };
+$opt->{output_file} =		"output.xmltv";
+$opt->{movie_cache} =		"movie_data";
+$opt->{lang} = 			"en";
+$opt->{debug} =			0;
+$opt->{min_duration} =		35;	# 35 mins
+$opt->{max_duration} =		6;	# 6 hours
+$opt->{skip_categories} = 	"Infotainment,Shopping,Business and Finance,Game Show,News,Parliament,Current Affairs,sports,Sport,Weather,Reality,live,Series";
+$opt->{title_overrides} =       "Bizarre Foods,Station Close,Volumz,Extra,Insiders";
+$opt->{cache_details_for} =	8;	# base cache validity in days. Default 8 so data should be available in cache for a standard 7 day guide
+$opt->{cache_expiry_spread} = 	14;	# rng an expiry spread so total cache doesnt always expire at the same time and to try and prevent TMDb rate limiting
+
+
+GetOptions(
+	'region=i'		=> \$opt->{region},		# ignored
+	'days=i'		=> \$opt->{days},		# ignored
+	'offset=i'		=> \$opt->{offset},		# ignored
+	'timezone=s'		=> \$opt->{timezone},		# ignored
+	'channels_file=s' 	=> \$opt->{channels_file},	# ignored
+	'config-file=s'		=> \$opt->{configfile},		# ignored
+
+        'min_duration=i'        => \$opt->{min_duration},
+        'max_duration=i'        => \$opt->{max_duration},
+	'skip-categories=s'	=> \$opt->{skip_categories},
+        'title-overrides=s'     => \$opt->{title_overrides},
+	'cache_details_for=i' 	=> \$opt->{cache_details_for},
+	'cache_expiry_spread=i'	=> \$opt->{cache_expiry_spread},
+
+	'output=s'		=> \$opt->{output_file},
+	'movie-cache=s'		=> \$opt->{movie_cache},
+	'no-cache'		=> \$opt->{no_cache},
+	'debug+'		=> \$opt->{debug},
+	'lang=s'		=> \$opt->{lang},		# ignored, left here to strip from ARGV in case Shepherd calls with it
+        'no-retry'              => \$opt->{dont_retry},		# ignored, left here to strip from ARGV in case Shepherd calls with it
+	'help'			=> \$opt->{help},
+	'test=s'		=> \$opt->{test},
+        'expire'                => \$opt->{expire},
+	'set=s'			=> \$opt->{set},		# ignored, left here to strip from ARGV in case Shepherd calls with it
+	'verbose'		=> \$opt->{debug},
+	'version'		=> \$opt->{version},
+	'ready'			=> \$opt->{ready},
+	'desc'			=> \$opt->{desc},
+	'v'			=> \$opt->{version});
+
+printf "%s v%s\n",$progname,$version;
+
+if ($opt->{version} || $opt->{desc} || $opt->{help} || $opt->{ready} ||
+    $opt->{output_file} eq "") {
+	printf "Augments XMLTV data with program information from ".
+	  "The Movie Database (www.tmdb.org)\n" if $opt->{desc};
+
+	printf "$progname is ready for operation.\n" if ($opt->{ready});
+
+	printf "No --output file specified.\n" if ($opt->{output_file} eq "");
+
+	if ($opt->{help} || $opt->{output_file} eq "") {
+		print<<EOF
+
+usage: $0 [options] {FILE(s)}
+
+This product uses the TMDb API but is not endorsed or certified by TMDb.
+
+The Movie Database (TMDb) is a free and open sourced movie and TV show database, created by Travis Bell in 2008.
+TMDb is entirely crowd sourced, therefore post processors like this one only function as effectively as the data
+that is provided by volunteers. If you want to support this post processor please consider creating an account 
+at www.themoviedb.org and becoming an active contributor.
+
+Supported options include:
+  --min_duration={min}		ignore programs under {min} duration (default: $opt->{min_duration} min)
+  --max_duration={hrs}		ignore programs over {hrs} duration (default: $opt->{max_duration} hours)
+  --skip-categories={list}	don't try to look up programs in these categories (default: $opt->{skip_categories})
+  --title-overrides={list}      skip programs with titles exactly matching (default: $opt->{title_overrides})
+
+  --cache_details_for={days}	cache program details for {days} (default: $opt->{cache_details_for} days)
+  --cache_expiry_spread={days}	spread cache expiry times randomly over additional 0 to {days} (default: $opt->{cache_expiry_spread} days)
+
+  --lang={lang}			set language to {lang} (default: $opt->{lang})
+  --output={file}		send final XMLTV output to {file} (default: $opt->{output_file})
+  --debug			enable debugging
+
+  --movie-cache={name}		local name to use as our movie cache, will be stored in the directory the program is executed from (default: $opt->{movie_cache})
+  --no-cache			don't use local cache, each request required will be sent to TMDb
+
+  --test=(string)		operate in 'test mode', look up program "my test title (date)" where date is optional. --output is ignored.
+  --expire                      manually force the cache to expire entries that are in the same code path as the --test switch.
+                                useful mainly for debugging without having to rebuild the whole cache (which can be very very slow).
+                                must be used with --test. --output is ignored. requires --movie-cache or will imply default $opt->{movie_cache}.
+EOF
+;
+	}
+	exit(0);
+}
+
+# set defaults
+Shepherd::Common::set_default("debug", ((defined $opt->{debug} && $opt->{debug} > 0) ? 2 : 0));
+Shepherd::Common::set_default("stats", \%stats);
+Shepherd::Common::set_default("retry_delay", 10);
+Shepherd::Common::set_default("delay", int(rand(4) + 3));
+Shepherd::Common::set_default('fake' => 0);
+
+if (($opt->{expire}) && ($opt->{no_cache})) { print "Option --expire cannot be used with --no-cache, Fatal\n"; exit(255); }
+if (($opt->{expire}) && !($opt->{test})) { print "Option --expire requires the use of --test, Fatal\n"; exit(255); }
+
+#&prepare_cache unless ($opt->{no_cache});
+&restore_cache unless ($opt->{no_cache});
+&run_test if (defined $opt->{test});
+
+Shepherd::Common::log(sprintf "\n");
+Shepherd::Common::log(sprintf "This product uses the TMDb API but is not endorsed or certified by TMDb.");
+Shepherd::Common::log(sprintf "\n");
+Shepherd::Common::log(sprintf "The Movie Database (TMDb) is a free and open sourced movie and TV show database, created by Travis Bell in 2008.");
+Shepherd::Common::log(sprintf "TMDb is entirely crowd sourced, therefore post processors like this one only function as effectively as the data");
+Shepherd::Common::log(sprintf "that is provided by volunteers. If you want to support this post processor please consider creating an account");
+Shepherd::Common::log(sprintf "at www.themoviedb.org and becoming an active contributor.");
+Shepherd::Common::log(sprintf "\n");
+
+
+Shepherd::Common::log(sprintf "started: cache %s, %soutput %s",
+        ($opt->{no_cache} ? "disabled" : "enabled"),
+        ($opt->{debug} ? "debug enabled, " : ""),
+        ($opt->{output_file}));
+
+if (scalar(@ARGV) == "0") {Shepherd::Common::log(sprintf "No input file provided, exiting."); exit;}
+
+foreach my $file (@ARGV) {
+        Shepherd::Common::log(sprintf "Parsing: %s", ($file));
+        $twig->parsefile( $file );
+}
+
+my $root= $twig->root;           # get the root of the twig
+
+my @programs = $root->children;    # get the program list
+PROGRAM: foreach $program (@programs)     # the unsorted list
+{
+    my $aug_data;
+
+    if ( (time - $last_checked) > 120)
+    {
+        Shepherd::Common::log(sprintf "Progress update - run %d seconds - Processed %d programs, sought data from a website %d times, updated %d programs",
+             time - $script_start_time,
+             $program_hits,
+             $website_hits,
+             $programs_updated);
+        $last_checked = time;
+    }
+
+    if ($program->first_child_text('title') eq "")
+    {
+        $not_program++;
+        printf ("Program element has no title child, most likely a channel definition \(particular if it is at the top\). Skipping.\n") if ($opt->{debug});
+        next PROGRAM; # No title must be channel or something else leave it alone.
+    }
+    $program_hits++;
+
+    if ($program->has_child('sub-title'))
+    {
+        $programs_skipped_subtitle++;
+        printf ("Found a subtitle child. Skipping \"" . $program->first_child_text('title') . ".\"\n") if ($opt->{debug});
+        next PROGRAM; # if it has sub title assume it is series. Got to start somewhere
+    }
+
+    if ($program->has_child('length')) {
+        if ($program->first_child('length')->{'att'}->{'units'} eq "minutes") {
+            if (($program->first_child('length')->text) < $opt->{min_duration}) {
+                printf ("Program length less than " . $opt->{min_duration} . "minutes. Skipping \"" . $program->first_child_text('title') . "\".\n") if ($opt->{debug});
+                $programs_skipped_duration++; next PROGRAM; }}}
+
+    if ($program->has_child('length')) {
+        if ($program->first_child('length')->{'att'}->{'units'} eq "hours") {
+            if (($program->first_child('length')->text) > $opt->{max_duration}) {
+                printf ("Program length greater than " . $opt->{max_duration} . "hours. Skipping \"" . $program->first_child_text('title') . "\".\n") if ($opt->{debug});
+                $programs_skipped_duration++; next PROGRAM; }}}
+
+    my $elt;
+
+    if ($program->has_child('category')) {
+        foreach $elt ($program->first_child->next_siblings('category'))
+#        while( $elt = $elt->next_elt( $program, 'category'))
+        {
+            foreach my $skip_category (split(/,/,$opt->{skip_categories})) {
+                if (lc($elt->text_only) eq lc($skip_category)) {
+                    $stats{skipped_due_to_category}++;
+                    printf ("Found matching category exclusion of \"" . lc($elt->text_only) . "\". Skipping \"" . $program->has_child('title')->text . "\".\n") if ($opt->{debug});
+                    next PROGRAM; # if it matches exclusion list, skip it.
+                }
+            }
+        }
+    }
+
+    foreach my $title_overrides (split(/,/,$opt->{title_overrides})) {
+        if (lc($program->first_child_text('title')) eq lc($title_overrides)) {
+            printf ("Found matching title exclusion of \"" . lc($title_overrides) . "\". Skipping \"" . $program->has_child('title')->text . "\".\n") if ($opt->{debug});
+            $programs_skipped_title_override++; next PROGRAM; # if it matches exclusion list, skip it.
+        }
+    }
+
+    my $remember_title = $program->first_child_text('title');
+    my $remember_year = $program->first_child_text('date');
+
+    $aug_data = get_tmdb_augment_data($program->first_child('title')->text,$program->first_child_text('date'));
+
+    if ($aug_data)
+    {
+        if ($$aug_data{'imdb'})
+        {
+            foreach $elt ($program->first_child->next_siblings('episode-num'))
+            {
+                if ($elt->{'att'}->{'system'} eq "imdb.com")
+                {
+                    if (lc($elt->text) eq (lc("title/" . $$aug_data{'imdb'})))
+                    {
+                        printf "New imdb value of %s is equal to old imdb value of %s, we have a winner!\n", lc("title/" . $$aug_data{'imdb'}), lc($elt->text) if ($opt->{debug});
+                    }
+                    else
+                    {
+                        printf "New imdb value of %s is different to old imdb value of %s for title %s, we have probably made an error. Skipping.\n", lc("title/" . $$aug_data{'imdb'}), lc($elt->text), $remember_title if ($opt->{debug});
+                        $program_not_matched++;
+                        push @match_not_found, (sprintf "Failed to match program with starttime %s and channel %s and title \"%s\"",
+                            $program->{'att'}->{'start'},
+                            $program->{'att'}->{'channel'},
+                            $remember_title);
+                        next PROGRAM;
+                    }
+                }
+            }
+        }
+
+        print ("Will augment entry for " . $program->has_child('title')->text . ".\n") if ($opt->{debug});
+
+        # XMLTV absolutely (ABSOLUTELY) enforces ordering, so the following structure is important.
+        # starting to regret not using the xmltv module maybe?
+
+        # if star rating scrub all star rating and add star rating
+        if ($$aug_data{'star-rating'} ne "")
+        {
+            foreach $elt ($program->first_child->next_siblings('star-rating'))
+            {
+                $elt->delete;
+            }
+            $program->insert_new_elt('first_child', 'star-rating');
+            $program->first_child('star-rating')->insert_new_elt('first_child', 'value' => $$aug_data{'star-rating'});
+        }
+        else
+        {
+            foreach $elt ($program->first_child->next_siblings('star-rating'))
+            {
+                $elt->move('first_child',$program);
+            }
+        }
+
+        # next comes the rating. We dont have a rating at this time so need to move all the ratings to the top.
+        foreach $elt ($program->first_child->next_siblings('rating'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes the subtitles. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('subtitles'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes new. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('new'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes last-chance. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('last-chance'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes premiere. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('premiere'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes previously-shown. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('previously-shown'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes audio. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('audio'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes video. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('video'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes episode-num.
+        # scrub all xmltv_ns and onscreen as it mucks with MythTV xmltvparser.cpp logic. xmltvparser.cpp
+        # logic assumes must be a series if xmltv_ns or onscreen systems are present.
+        # "themoviedb.org" and "thetvdb.com" systems should parse correctly with mythtv
+        # imdb gets ignored but we are going to pull it in. give warning if already have imdb and it is different
+
+        my $found_tmdb_ns_ele = 0;
+        my $found_imdb_ns_ele = 0;
+        my $found_xmltv_ns_ele = 0;
+        foreach $elt ($program->first_child->next_siblings('episode-num'))
+        {
+            if ($elt->{'att'}->{'system'} eq "imdb.com")
+            {
+                $found_imdb_ns_ele++;
+                if ($found_imdb_ns_ele == 1)
+                {
+                    if ($$aug_data{'imdb'})
+                    {
+                        $program->insert_new_elt('first_child', 'episode-num' => ("title/" . $$aug_data{'imdb'}));
+                        $program->first_child('episode-num')->set_att("system", "imdb.com");
+                        $elt->delete;
+                    }
+                    else
+                    {
+                        $elt->move('first_child',$program);
+                    }
+                }
+                else
+                {
+                    $elt->delete;
+                }
+            }
+            elsif ($elt->{'att'}->{'system'} eq "themoviedb.org")
+            {
+                $found_tmdb_ns_ele++;
+                if ($found_tmdb_ns_ele == 1)
+                {
+                    if ($$aug_data{'tmdb_id'})
+                    {
+                        $program->insert_new_elt('first_child', 'episode-num' => ("movie/" . $$aug_data{'tmdb_id'}));
+                        $program->first_child('episode-num')->set_att("system", "themoviedb.org");
+                        $elt->delete;
+                    }
+                    else
+                    {
+                        $elt->move('first_child',$program);
+                    }
+                }
+                else
+                {
+                    $elt->delete;
+                }
+            }
+            else
+            {
+                $elt->delete;
+            }
+        }
+        $program->insert_new_elt('first_child', 'episode-num' => ("movie/" . $$aug_data{'tmdb_id'}));
+        $program->first_child('episode-num')->set_att("system", "themoviedb.org");
+
+        # next comes country. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('country'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes url. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('url'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes icon. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('icon'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes length. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('length'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes orig-language. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('orig-language'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes language. We dont have so move to top.
+        foreach $elt ($program->first_child->next_siblings('language'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # next comes category.
+        # if have some categories scrub all genres and add genres
+        if (scalar(@{$$aug_data{'category'}}) > 0)
+        {
+            foreach $elt ($program->first_child->next_siblings('category'))
+            {
+                $elt->delete;
+            }
+
+            # add an element to flag this program as type Movie
+            $program->insert_new_elt('first_child', 'category' => "Movie" );
+            $program->first_child('category')->set_att("lang", "en");
+
+            foreach my $augment_data_split_genre (@{$$aug_data{'category'}})
+            {
+                $program->insert_new_elt('first_child', 'category' => $augment_data_split_genre);
+                $program->first_child('category')->set_att("lang", "en");
+            }
+        }
+        else # move existing categories to top
+        {
+            foreach $elt ($program->first_child->next_siblings('category'))
+            {
+                if (lc($elt->text) eq lc("Movie"))
+                {
+                    $elt->delete;
+                }
+            }
+
+            my $print_once = 0;
+            foreach $elt ($program->first_child->next_siblings('category'))
+            {
+                if ($print_once == 0)
+                {
+                    print "\nWe **believe** we found a match to \"$remember_title ($remember_year)\" on TMDb. But we could not find any categories\n";
+                    print "The match might be wrong. If not, the guide data contains the following categories. If they are accurate\n";
+                    print "please consider creating an account at TMDb and contributing to the database. If all the categories below\n";
+                    print "are generic like \"Movie\" or \"Series\" (instead of like \"Comedy\") then they can be safely ignored.\n";
+                    $print_once++;
+                }
+                print ($elt->text . "\n");
+            }
+            $program->insert_new_elt('first_child', 'category' => "Movie" );
+            $program->first_child('category')->set_att("lang", "en");
+            foreach $elt ($program->first_child->next_siblings('category'))
+            {
+                if (lc($elt->text) eq lc("Movie"))
+                {
+                    next;
+                }
+                else
+                {
+                    $elt->move('first_child',$program);
+                }
+            }
+        }
+
+        # next comes date.
+        # scrub all date and add date. Will assume we have one given we have a valid result
+        if ($$aug_data{'date'} ne "")
+        {
+            foreach $elt ($program->first_child->next_siblings('date'))
+            {
+                $elt->delete;
+            }
+            $program->insert_new_elt('first_child', 'date' => $$aug_data{'date'});
+        }
+        else
+        {
+            my $print_once = 0;
+            foreach $elt ($program->first_child->next_siblings('date'))
+            {
+                if ($print_once == 0)
+                {
+                    print "\nWe **believe** wefound a match to \"$remember_title ($remember_year)\" on TMDb. But we could not find any release year\n";
+                    print "The match might be wrong. If not, the guide data contains the following year. If it is accurate please consider\n";
+                    print "creating an account at TMDb and contributing to the database\n";
+                    $print_once++;
+                }
+                print $elt->text, "\n";
+                $elt->move('first_child',$program);
+            }
+        }
+
+        # next comes credits.
+        # if actors or directors or producers scrub ALL credits and add whatever actors, directors, producers found
+        if (scalar(@{$$aug_data{'directors'}}) > 0 || scalar(@{$$aug_data{'actors'}}) > 0 || scalar(@{$$aug_data{'producers'}}) > 0)
+        {
+            foreach $elt ($program->first_child->next_siblings('credits'))
+            {
+                $elt->delete;
+            }
+            $program->insert_new_elt('first_child', 'credits');
+            foreach my $augment_data_split_producers (@{$$aug_data{'producers'}})
+            {
+                $program->first_child('credits')->insert_new_elt('first_child', 'producer' => $augment_data_split_producers);
+            }
+            foreach my $augment_data_split_directors (@{$$aug_data{'directors'}})
+            {
+                $program->first_child('credits')->insert_new_elt('first_child', 'director' => $augment_data_split_directors);
+            }
+            foreach my $augment_data_split_actors (@{$$aug_data{'actors'}})
+            {
+                $program->first_child('credits')->insert_new_elt('first_child', 'actor' => $augment_data_split_actors);
+            }
+        }
+        else # move whatever credits is already available
+        {
+            my $print_once = 0;
+            foreach $elt ($program->first_child->next_siblings('credits'))
+            {
+                if ($print_once == 0)
+                {
+                    print "\nWe **believe** we found a match to \"$remember_title ($remember_year)\" on TMDb. But we could not find any credits\n";
+                    print "The guide data contains the following credits. If they are accurate please consider creating\n";
+                    print "an account at TMDb and contributing to the database\n";
+                    $print_once++;
+                }
+                print $elt->text, "\n";
+                $elt->move('first_child',$program);
+            }
+        }
+
+        # next comes description.
+        # scrub all descriptions and add description
+        if (($$aug_data{'desc'} ne "No overview found.") && $$aug_data{'desc'} ne "")
+        {
+            foreach $elt ($program->first_child->next_siblings('desc'))
+            {
+                $elt->delete;
+            }
+            $program->insert_new_elt('first_child', 'desc' => $$aug_data{'desc'});
+            $program->first_child('desc')->set_att("lang", "en");
+        }
+        else
+        {
+            my $print_once = 0;
+            foreach $elt ($program->first_child->next_siblings('desc'))
+            {
+                if ($print_once == 0)
+                {
+                    print "\nWe **believe** we found a match to \"$remember_title ($remember_year)\" on TMDb. But we could not find any description\n";
+                    print "The guide data contains the following description. If it is accurate please consider creating\n";
+                    print "an account at TMDb and contributing to the database\n";
+                    $print_once++;
+                }
+                print ($elt->text . "\n");
+                $elt->move('first_child',$program);
+            }
+        }
+
+        # next comes subtitle. There are no subtitles or we would have exited at an earlier check. So ignore.
+        foreach $elt ($program->first_child->next_siblings('subtitle'))
+        {
+            $elt->move('first_child',$program);
+        }
+
+        # delete all titles and insert the new title at the top
+        # scrub all titles and add title
+        if ($$aug_data{'title'} ne "")
+        {
+            foreach $elt ($program->first_child->next_siblings('title'))
+            {
+                $elt->delete;
+            }
+            $program->insert_new_elt('first_child', 'title' => $$aug_data{'title'});
+            $program->first_child('title')->set_att("lang", "en");
+        }
+        else
+        {
+            my $print_once = 0;
+            foreach $elt ($program->first_child->next_siblings('title'))
+            {
+                if ($print_once == 0)
+                {
+                    print "\n*********************found a blank title, bad bad bad*******************\n";
+                    print "We stuffed up and found a match to \"$remember_title ($remember_year)\" on TMDb. But we could not find any title\n";
+                    print "The guide data contains the following title. We will try harder next time, but please feel free to\n";
+                    print "report this title on the shepherd forums and hopefully someone will work out what went wrong.\n";
+                    $print_once++;
+                }
+                print ($elt->text . "\n");
+                $elt->move('first_child',$program);
+            }
+        }
+
+        $programs_updated++;
+
+        print ("   Augmented entry for " . $$aug_data{'title'} . ".\n") if ($opt->{debug});
+
+        if ($remember_title eq $$aug_data{'title'})
+        {
+            push @augmentation_list, (sprintf "Augmented program with starttime %s and channel %s and title \"%s\"", 
+                $program->{'att'}->{'start'},
+                $program->{'att'}->{'channel'},
+                $$aug_data{'title'});
+        }
+        else
+        {
+            push @augmentation_list_new_title, (sprintf "Augmented program at starttime %s and channel %s.
+from title \"%s\"
+  to title \"%s\"",
+                $program->{'att'}->{'start'},
+                $program->{'att'}->{'channel'},
+                $remember_title,
+                $$aug_data{'title'});
+        }
+    }
+    else
+    {
+        $program_not_matched++;
+        push @match_not_found, (sprintf "Failed to match program with starttime %s and channel %s and title \"%s\"",
+                $program->{'att'}->{'start'},
+                $program->{'att'}->{'channel'},
+                $remember_title);
+    }
+}
+
+
+open ($fh, '>', $opt->{output_file}) or die "unable to open $opt->{output_file} for writing: $!";
+binmode($fh, ":encoding(Latin1)") || die "can't binmode to encoding Latin1";
+$twig->print($fh, keep_atts_order => 1, pretty_print => 'indented', twig_print_outside_roots => 1); # this prints to the filehandle
+close ($fh);
+
+$opt->{debug} = 1;
+print "\n\n" if ($opt->{debug});
+print ("Exactly matched the following program list\n") if ($opt->{debug});
+print Dumper(@augmentation_list) if ($opt->{debug});
+print "\n\n" if ($opt->{debug});
+print ("Rejected supplied matches from TMDb for the following program list\n") if ($opt->{debug});
+print Dumper(@rejected_not_sane) if ($opt->{debug});
+print "\n\n" if ($opt->{debug});
+print ("Determined a match for the following program list\n") if ($opt->{debug});
+print Dumper(@augmentation_list_new_title) if ($opt->{debug});
+print "\n\n" if ($opt->{debug});
+print ("Failed to match the following program list\n") if ($opt->{debug});
+print Dumper(@match_not_found) if ($opt->{debug});
+print "\n\n" if ($opt->{debug});
+
+Shepherd::Common::log(sprintf "Processed a total of %s programs", $program_hits);
+Shepherd::Common::log(sprintf "Utilised cache %s times \(note a progam can have up to 4 alternative entries in the cache\)", $cache_hits);
+Shepherd::Common::log(sprintf "Sought data from a website %s times", $website_hits);
+Shepherd::Common::log(sprintf "Updated %s programs", $programs_updated);
+Shepherd::Common::log(sprintf "%d programs skipped due to duration, %d skipped due to subtitles, %d skipped due to category.",
+    $programs_skipped_duration, $programs_skipped_subtitle, $stats{skipped_due_to_category});
+Shepherd::Common::log(sprintf "%d programs skipped for title override exclusion", $programs_skipped_title_override);
+Shepherd::Common::log(sprintf "%d entries were not considered programs", $not_program);
+Shepherd::Common::log(sprintf "Failed to match %d programs", $program_not_matched);
+Shepherd::Common::log(sprintf "TMDb x-rate-limit max is 40 requests per 10sec. Max usage was %d requests remaining.", $xratelimit_min);
+Shepherd::Common::print_stats($progname, $version, $script_start_time, %stats);
+
+&save_cache unless ($opt->{no_cache});
+
+exit(0);
+
+
+########################################################################
+# functions
+########################################################################
+
+
+sub restore_cache
+{
+    print "Restoring cache.\n";
+    $movie_cache = Shepherd::Common::read_cache($opt->{'movie_cache'});
+    my $counter = 0;
+
+    foreach (keys %$movie_cache)
+    {
+        if ($movie_cache->{$_}->{'expiry'} < ($script_start_time - (60 * 60 * 27))) # expire when expiry time is 27hrs in the past
+        {
+            delete $movie_cache->{$_};
+        }
+    }
+    print "Restored cache.\n";
+}
+
+sub save_cache
+{
+    print "Saving cache.\n";
+    Shepherd::Common::write_cache($opt->{'movie_cache'}, $movie_cache);
+}
+
+
+sub flush_to_cache
+{
+    Shepherd::Common::write_cache($opt->{'movie_cache'}, $movie_cache);
+    $movie_cache = Shepherd::Common::read_cache($opt->{'movie_cache'});
+}
+
+
+sub prepare_cache
+{
+    Shepherd::Common::log(sprintf "linking to cache %s",
+        ($opt->{movie_cache}));
+#    $movie_cache = CHI->new( driver => 'File',
+#        'root_dir' => cwd(),
+#        'namespace' => ($opt->{movie_cache}),
+#        'label' => ($opt->{movie_cache}) );
+}
+
+
+sub get_page
+{
+    $website_hits++;
+    my @response = Shepherd::Common::get_url(@_);
+    if ($response[2] ne "200 OK") { print $response[2], "\n"; return; }
+    my $xratelimit = ($response[6]->header('x-ratelimit-remaining'));
+    if ($xratelimit < $xratelimit_min)
+    {
+        $xratelimit_min = $xratelimit;
+    }
+    if ($xratelimit < 20)
+    {
+        Shepherd::Common::log(sprintf "x-rate-limit is 40 requests per 10sec. %d requests remaining.", $xratelimit);
+        sleep 5;
+    }
+    elsif ($xratelimit < 10)
+    {
+        Shepherd::Common::log(sprintf "x-rate-limit is 40 requests per 10sec. %d requests remaining.", $xratelimit);
+        sleep 10;
+    }
+
+    if (!$stats{failed_requests}) {
+        $stats{failed_requests} = 0; }
+    if ($stats{successful_requests} and $stats{failed_requests} > ($stats{successful_requests} * 5))
+    {
+        printf "Exiting: %d failed network requests vs %d successes.\n",
+             $stats{failed_requests}, $stats{successful_requests};
+#        print stats(1);
+        die "Too many network failures.";
+    }
+
+    if ($response[2] eq "200 OK")
+    {
+            my $ret = $response[0];
+#            encode_entities($ret,'&');
+            $ret =~ s/&nbsp;/ /g if ($ret);
+            $ret =~ s#\’#\'#g if ($ret);
+            $ret =~ s#\‘#\'#g if ($ret);
+            $ret =~ s#\–#\-#g if ($ret);
+            $ret =~ s#\“#\'#g if ($ret);
+            $ret =~ s#\‟#\'#g if ($ret);
+            $ret =~ s#\”#\'#g if ($ret);
+            $ret =~ s#\Č#C#g if ($ret);
+            $ret =~ s#\ć#c#g if ($ret);
+            $ret =~ s#\—#\-#g if ($ret);
+            $ret =~ s#…#...#g if ($ret);
+            $ret =~ s#ō#o#g if ($ret);
+            $ret =~ s#€#\$#g if ($ret);
+            $ret =~ s#&amp;#&#g if ($ret);
+            $ret =~ s#&#&amp;#g if ($ret);
+            $ret =~ s#\\u0026#&amp;#g;
+            $ret =~ s#\\u201f#\'#g;
+            $ret =~ s#\\u2026#...#g;
+            $ret =~ s#\\u014d#o#g;
+            $ret =~ s#\\u20ac#\$#g;
+            return $ret;
+    }
+    else
+    {
+        print $response[2], "\n";
+        return;
+    }
+}
+
+sub refresh_ua
+{
+    print "Refreshing UA.\n" if ($opt->{debug});
+    if ($ua)
+    {
+#       print stats() if ($opt->{debug} and $opt->{stats});
+       print "Sleeping...\n" if ($opt->{debug});
+       sleep_for(5 + int(rand(20)));
+    }
+
+    $ua = Shepherd::Common::setup_ua( cookie_jar => 1 );
+}
+
+sub get_tmdb_augment_data
+{
+    # from a provided title and optional year
+    # return hash of augment parameters
+    # return undef() if not able to find exact match
+
+    my ($search_title, $search_year) = @_;
+    if (!$search_title) {print "Sub routine get_tmdb_augment_data called with no title. Should not be possible. Fatal"; exit(255);}
+    if (!$search_year) {$search_year = "1800";}
+    my $output;
+    # try with search year if present and not equal to 1800
+    if ($search_year ne "1800")
+    {
+        # call with no adult first
+        $output = get_tmdb_augment_data_cache($search_title, $search_year, "false");
+        if ($$output{'total_results'} gt 1)
+        {
+            return undef(); # too many cant narrow down from here
+        }
+        elsif ($$output{'total_results'} == 1)
+        {
+            return $output; # found
+        }
+
+        # call with adult next
+        $output = get_tmdb_augment_data_cache($search_title, $search_year, "true");
+        if ($$output{'total_results'} gt 1)
+        {
+            return undef(); # too many cant narrow down from here
+        }
+        elsif ($$output{'total_results'} == 1)
+        {
+            return $output; # found
+        }
+    }
+    # call with no adult first
+    $output = get_tmdb_augment_data_cache($search_title, "1800", "false");
+    if ($$output{'total_results'} gt 1)
+    {
+        return undef(); # too many cant narrow down from here
+    }
+    elsif ($$output{'total_results'} == 1)
+    {
+        return $output; # found
+    }
+
+    # call with adult next
+    $output = get_tmdb_augment_data_cache($search_title, "1800", "true");
+    if ($$output{'total_results'} gt 1)
+    {
+        return undef(); # too many cant narrow down from here
+    }
+    elsif ($$output{'total_results'} == 1)
+    {
+        return $output; # found
+    }
+
+    # didnt find a match return undef()
+    return undef();
+}
+
+
+sub get_tmdb_augment_data_cache
+{
+    # from a provided title, year and adult
+    # return hash of augment parameters
+    # returns a result even if no or multiple matches
+    # pulls from cache if possible or else calls website
+    # from this point on title has white spaces converted to %20. Cache is indexed with spaces as %20.
+    # calls to the website still go through this cache routine even if no_cache is set
+
+    my $output;
+    my ($search_title, $search_year, $search_inc_adult) = @_;
+    if (!$search_title) {print "Sub routine get_tmdb_augment_data_cache called with no title. Should not be possible. Fatal"; exit(255);}
+    if (!$search_year) {print "Sub routine get_tmdb_augment_data_cache called with no year. Should not be possible. Fatal"; exit(255);}
+    if (!$search_inc_adult) {print "Sub routine get_tmdb_augment_data_cache called with no adult flag. Should not be possible. Fatal"; exit(255);}
+
+#    $search_title =~ s# #\%20#g;
+#    $search_title =~ s#\###g;
+    my $cache_concat = $search_title . ":::" . $search_year . ":::" . $search_inc_adult;
+
+    if (not $opt->{no_cache})
+    {
+        $output = $movie_cache->{$cache_concat} if ($movie_cache->{$cache_concat});
+#        $output = $movie_cache->get($cache_concat);
+        $cache_hits++;
+    }
+
+    if (not $output)
+    {
+        $output = get_tmdb_augment_data_website($search_title,$search_year,$search_inc_adult);
+    }
+    return $output;
+}
+
+sub get_tmdb_augment_data_website
+{
+    # from a provided title, year and adult
+    # return hash of augment parameters
+    # returns a result even if no or multiple matches
+    # does not check cache, only pulls from website
+    # but will add positive results to cache
+
+    my @genre_array;
+    my @actor_array;
+    my @director_array;
+    my @producer_array;
+    my @titles_array;
+    my $title_sane = 0;
+    my ($search_title, $search_year, $search_inc_adult) = @_;
+    my $output;
+    my $search_year_str;
+    my $clean_title = $search_title;
+    $search_title =~ s# #\%20#g;
+    $search_title =~ s#\###g;
+
+    if ($search_year == 1800)
+    {
+        $search_year_str = "";
+    }
+    else
+    {
+        $search_year_str = "&year=" . $search_year;
+    }
+    refresh_ua() unless ($ua);
+    my $url = sprintf "https://api.themoviedb.org/3/search/movie?%s&language=en-US&query=%s&page=1&include_adult=%s%s", $API_KEY, $search_title, $search_inc_adult, $search_year_str;
+    my $search_result = get_page($url);
+    my $match_index;
+
+    if (not $search_result)
+    {
+        return undef();
+    }
+    else
+    {
+        my $search_json = JSON::decode_json($search_result);
+        if ($search_json->{total_results} == 1)
+        {
+            $match_index = 0;
+        }
+        elsif ($search_json->{total_results} > 1) # this test is to see if we can get a single exact match on title from all results. It is a last ditch effort as have not passed on lang or country elements at this stage.
+        {
+            my $match_count = 0;
+            my $multi_temp_title;
+            my $multi_upper_limit;
+            if ($search_json->{total_results} > 20) {
+                $multi_upper_limit = 20; } # putting an upper limit on the number of results to wade through. Hopefully TMDb put the most likely matches at the top.
+            else { $multi_upper_limit = $search_json->{total_results}; }
+            for (my $multi_result_index=0; $multi_result_index < $multi_upper_limit; $multi_result_index++)
+            {
+#                $multi_temp_title = NFKD($search_json->{results}[$multi_result_index]{title});
+#                $multi_temp_title =~ s#\p{NonspacingMark}##g;
+                $multi_temp_title = $search_json->{results}[$multi_result_index]{title};
+                if ($multi_temp_title eq $clean_title)
+                {
+                    if ($match_count gt 0) # if gt 0 then have already found a prior exact match and this is a second exact match. No point continuing
+                    {
+                        $$output{'total_results'} = $search_json->{total_results}; # store the total results in case it is useful
+#                        if ($opt->{expire}) { $movie_cache->remove($search_title . ":::" . $search_year . ":::" . $search_inc_adult); }
+#                        else { $movie_cache->set($search_title . ":::" . $search_year . ":::" . $search_inc_adult, $output, ((int rand ($opt->{cache_expiry_spread} * 24 * 60)) + ($opt->{cache_details_for} * 24 * 60)) . " min") if not ($opt->{no_cache}); }
+                        if ($opt->{expire}) { delete $movie_cache->{$clean_title . ":::" . $search_year . ":::" . $search_inc_adult}; }
+                        else { $$output{'expiry'} = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60)) + ($opt->{cache_details_for} * 24 * 60 * 60)) + $script_start_time); $movie_cache->{$clean_title . ":::" . $search_year . ":::" . $search_inc_adult} = $output if not ($opt->{no_cache}); }
+                        flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+                        return $output; # need to return here as this is all the info we can get
+                    }
+                    elsif ($match_count == 0)
+                    {
+                        $match_count++;
+                        $match_index = $multi_result_index;
+                    }
+                }
+                if ($multi_result_index == ($multi_upper_limit - 1) && ($match_count < 1)) # this is the end of the last loopthrough and we didnt find an exact match
+                {
+                    $$output{'total_results'} = $search_json->{total_results}; # store the total results in case it is useful
+#                    if ($opt->{expire}) { $movie_cache->remove($search_title . ":::" . $search_year . ":::" . $search_inc_adult); }
+#                    else { $movie_cache->set($search_title . ":::" . $search_year . ":::" . $search_inc_adult, $output, ((int rand ($opt->{cache_expiry_spread} * 24 * 60)) + ($opt->{cache_details_for} * 24 * 60)) . " min") if not ($opt->{no_cache}); }
+                    if ($opt->{expire}) { delete $movie_cache->{$clean_title . ":::" . $search_year . ":::" . $search_inc_adult}; }
+                    else { $$output{'expiry'} = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60)) + ($opt->{cache_details_for} * 24 * 60 * 60)) + $script_start_time); $movie_cache->{$clean_title . ":::" . $search_year . ":::" . $search_inc_adult} = $output if not ($opt->{no_cache}); }
+                    flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+                    return $output; # need to return here as this is all the info we can get
+                }
+            }
+        }
+        else
+        {
+            $$output{'total_results'} = $search_json->{total_results}; # store the total results in case it is useful, should be zero
+#            if ($opt->{expire}) { $movie_cache->remove($search_title . ":::" . $search_year . ":::" . $search_inc_adult); }
+#            else { $movie_cache->set($search_title . ":::" . $search_year . ":::" . $search_inc_adult, $output, ((int rand ($opt->{cache_expiry_spread} * 24 * 60)) + ($opt->{cache_details_for} * 24 * 60)) . " min") if not ($opt->{no_cache}); }
+            if ($opt->{expire}) { delete $movie_cache->{$clean_title . ":::" . $search_year . ":::" . $search_inc_adult}; }
+            else { $$output{'expiry'} = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60)) + ($opt->{cache_details_for} * 24 * 60 * 60)) + $script_start_time); $movie_cache->{$clean_title . ":::" . $search_year . ":::" . $search_inc_adult} = $output if not ($opt->{no_cache}); }
+            flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+            return $output; # need to return here as this is all the info we can get
+        }
+
+        if (not defined ($match_index)) { print "Match index is not defined, should not be possible. Fatal"; exit(255); } 
+
+        $$output{'total_results'} = 1;
+#        $$output{'desc'} = NFKD($search_json->{results}[$match_index]{overview});
+#        $$output{'desc'} =~ s#\p{NonspacingMark}##g;
+        $$output{'desc'} = $search_json->{results}[$match_index]{overview};
+        $$output{'desc'} =~ s#[’]#'#g; # Mythweb doesn't like
+#        $$output{'title'} = NFKD($search_json->{results}[$match_index]{title});
+#        $$output{'title'} =~ s#\p{NonspacingMark}##g;
+#        $$output{'title'} =~ s#[’]#'#g;
+        $$output{'title'} = $search_json->{results}[$match_index]{title};
+        push @titles_array, $$output{'title'};
+        $$output{'date'} = substr $search_json->{results}[$match_index]{release_date}, 0, 4;
+        if ($search_json->{results}[$match_index]{vote_count} >= "5") # will only accept a rating if it has at least 5 votes present
+        {
+            $$output{'star-rating'} = (substr $search_json->{results}[$match_index]{vote_average}, 0, 3) . "/10";
+        }
+        else
+        {
+            $$output{'star-rating'} = "";
+        }
+        $$output{'tmdb_id'} = $search_json->{results}[$match_index]{id};
+
+        my $tmdb_genre_list = get_tmdb_augment_data_genre();
+        foreach my $find_genre (@{$search_json->{results}[$match_index]{genre_ids}})
+        {
+            if(!($$tmdb_genre_list{$find_genre})) { next; }
+            unshift @genre_array, $$tmdb_genre_list{$find_genre};
+        }
+        $$output{'category'} = \@genre_array;
+
+        # to this point we have the desc, date, stars and genre, lets try for the credits
+#        $url = sprintf "https://api.themoviedb.org/3/movie/%s/credits?%s", $$output{'tmdb_id'}, $API_KEY;
+        $url = sprintf "https://api.themoviedb.org/3/movie/%s?%s&language=en-US&append_to_response=credits,alternative_titles", $$output{'tmdb_id'}, $API_KEY;
+
+        $search_result = get_page($url);
+        $search_json = JSON::decode_json($search_result);
+        $$output{'imdb'} = $search_json->{'imdb_id'};
+        my $cast_limit = 0; # return only the first 6 cast members, no sorting just based on the order sent be TMDb
+        CAST_LIMIT: foreach my $search_cast (@{$search_json->{credits}->{cast}})
+        {
+            $cast_limit++;
+#            my $clean_cast_name = NFKD($search_cast->{'name'});
+#            $clean_cast_name =~ s#\p{NonspacingMark}##g;
+#            unshift @actor_array, $clean_cast_name;
+            unshift @actor_array, $search_cast->{'name'};
+            last CAST_LIMIT if ($cast_limit == 6);
+        }
+
+        foreach my $search_crew (@{$search_json->{crew}})
+        {
+#            my $clean_crew_name = NFKD($search_crew->{'name'});
+#            $clean_crew_name =~ s#\p{NonspacingMark}##g;
+            if ($search_crew->{job} eq "Director")
+            {
+#                unshift @director_array, $clean_crew_name;
+                unshift @director_array, $search_crew->{'name'};
+            }
+            elsif ($search_crew->{job} eq "Executive Producer")
+            {
+#                unshift @producer_array, $clean_crew_name;
+                unshift @producer_array, $search_crew->{'name'};
+            }
+        }
+
+        $$output{'actors'} = \@actor_array;
+        $$output{'directors'} = \@director_array;
+        $$output{'producers'} = \@producer_array;
+
+        # just found that tmdb fuzzy matching can match words across all titles / alternative titles.
+        # in at least one case this can result in an exact match being returned on a title that has
+        # to a very very large degree absolutely nothing to do with the search string.
+        # Aim: programatically make sure title search terms (string split on whitespace) appear in a single title / alternative title.
+        # If it does not, prevent valid match being made.
+
+#        $url = sprintf "https://api.themoviedb.org/3/movie/%s/alternative_titles?%s", $$output{'tmdb_id'}, $API_KEY;
+#        $search_result = get_page($url);
+#        $search_json = JSON::decode_json($search_result);
+
+        foreach my $search_alt_titles (@{$search_json->{alternative_titles}->{titles}})
+        {
+#            my $intermed_string = NFKD($search_alt_titles->{title});
+#            $intermed_string =~ s#\p{NonspacingMark}##g;
+#            push @titles_array, $intermed_string;
+            push @titles_array, $search_alt_titles->{title};
+        }
+
+        TITLE_SANITY: foreach my $check_titles (@titles_array)
+        {
+            my $length_check;
+            my $count_match_char = 0;
+            if (length($check_titles) < length($clean_title)) { $length_check = length($check_titles); }
+            elsif (length($check_titles) > length($clean_title)) { $length_check = length($clean_title); }
+            else { $length_check = length($check_titles); }
+            for(0 .. $length_check)
+            {
+                my $compare_char = substr($check_titles, $_, 1);
+                if($compare_char eq substr($clean_title, $_, 1))
+                {
+                    $count_match_char++;
+                }
+            }
+            if ((($count_match_char * 10) / $length_check) >= "8") # accept new title if at least 80% of characters match in order.
+            {
+                $title_sane = 1;
+                last TITLE_SANITY;
+            }
+
+            for(0 .. $length_check)
+            {
+                my $compare_char = substr((scalar reverse $check_titles), $_, 1);
+                if($compare_char eq substr((scalar reverse $clean_title), $_, 1))
+                {
+                    $count_match_char++;
+                }
+            }
+            if ((($count_match_char * 10) / $length_check) >= "8") # accept new title if at least 80% of characters match in order.
+            {
+                $title_sane = 1;
+                last TITLE_SANITY;
+            }
+
+            my $outer_counter = 0;
+            my $match_counter = 0;
+            foreach my $split_search_title (split(/ /,$clean_title)) # kludge to try and make sure title search terms (string split on whitespace) appear in a single title / alternative title.
+            {
+                $outer_counter++;
+                if (index(lc($check_titles), lc($split_search_title)) != -1)
+                {
+                    $match_counter++;
+                } 
+            }
+            if ($outer_counter == $match_counter) # then all search string terms are in title
+            {
+                if ((length($clean_title) * 10) / length($check_titles) >= "6") # accept new title if at least 60% of length of original title for some fuzzy matching.
+                {
+                    $title_sane = 1;
+                    last TITLE_SANITY;
+                }
+            }
+            push @rejected_not_sane, (sprintf "\"%s\" - Is not a sane matching title for \"%s\".", $check_titles, $clean_title);
+            Shepherd::Common::log(sprintf "\"%s\" - Is not a sane matching title for \"%s\".", $check_titles, $clean_title) if ($opt->{debug});
+            Shepherd::Common::log(sprintf "If this is an error, please post a message to the Shepherd support group.") if ($opt->{debug});
+        }
+        if ($title_sane == 0)
+        {
+            $$output{'total_results'} = 0; # setting total_results to zero is important as this will flag future processes not to use the data. But this could potentially mask a search with multiple results.
+        }
+
+#        if ($opt->{expire}) { $movie_cache->remove($search_title . ":::" . $search_year . ":::" . $search_inc_adult); }
+#        else { $movie_cache->set($search_title . ":::" . $search_year . ":::" . $search_inc_adult, $output, ((int rand ($opt->{cache_expiry_spread} * 24 * 60)) + ($opt->{cache_details_for} * 24 * 60)) . " min") if not ($opt->{no_cache}); }
+        if ($opt->{expire}) { delete $movie_cache->{$clean_title . ":::" . $search_year . ":::" . $search_inc_adult}; }
+        else { $$output{'expiry'} = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60)) + ($opt->{cache_details_for} * 24 * 60 * 60)) + $script_start_time); $movie_cache->{$clean_title . ":::" . $search_year . ":::" . $search_inc_adult} = $output if not ($opt->{no_cache}); }
+        flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+    }
+    return $output;
+}
+
+sub get_tmdb_augment_data_genre
+{
+    my $output;
+    my $cache_concat = "TMDb_Genre_ID_Pairs" . ":::" . "1800" . ":::" . "true";
+
+    if (not $opt->{no_cache})
+    {
+        $output = $movie_cache->{$cache_concat} if ($movie_cache->{$cache_concat});
+#        $output = $movie_cache->get($cache_concat);
+         $cache_hits++;
+    }
+
+    if (not defined $output)
+    {
+        refresh_ua() unless ($ua);
+        my $url = sprintf "https://api.themoviedb.org/3/genre/movie/list?%s&language=en-US", $API_KEY;
+        my $search_result = get_page($url);
+        if (not defined $search_result)
+        {
+            return undef();
+        }
+        else
+        {
+            my $found_genre_id_match = 0;
+            my $found_genre_name_match =0;
+            my $found_genre_id = 0;
+            $$output{'total_results'} = 1;
+
+            foreach my $tmdb_genre_split (split(/[,:\"\{\}]+/,$search_result)) {
+                if ($tmdb_genre_split eq "genres") {
+                    next; }
+                elsif ($tmdb_genre_split eq "name")
+                {
+                    $found_genre_name_match = 1;
+                }
+                elsif ($tmdb_genre_split eq "id")
+                {
+                    $found_genre_id_match = 1;
+                }
+                else
+                {
+                    if ($found_genre_id_match == 1)
+                    {
+                        $found_genre_id = $tmdb_genre_split;
+                        $found_genre_id_match = 0;
+                    }
+                    elsif ($found_genre_name_match == 1)
+                    {
+                        $$output{$found_genre_id} = $tmdb_genre_split;
+                        $found_genre_name_match = 0;
+                    }
+                }
+            }
+
+#            if ($opt->{expire}) { $movie_cache->remove($cache_concat); }
+#            else { $movie_cache->set($cache_concat, $output, ((int rand ($opt->{cache_expiry_spread} * 24 * 60)) + ($opt->{cache_details_for} * 24 * 60)) . " min") if not ($opt->{no_cache}); }
+            if ($opt->{expire}) { delete $movie_cache->{$cache_concat}; }
+            else { $$output{'expiry'} = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60)) + ($opt->{cache_details_for} * 24 * 60 * 60)) + $script_start_time); $movie_cache->{$cache_concat} = $output if not ($opt->{no_cache}); }
+            flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+        }
+    }
+    return $output;
+}
+
+sub run_test
+{
+    my $test_title;
+    my $test_date;
+    my $aug_data;
+    my $remember_cache_switch = $opt->{no_cache};
+
+    # no-cache needs to be set to touch the cache using the same code paths as set cache. But felt it was counter-intuitive
+    # to require the user to set no-cache when clearing elements. So handle in code instead.
+    if ($opt->{expire})
+    {
+        $opt->{no_cache} = 1;
+    }
+
+    if (($opt->{test}) =~ / \(\)$/)
+    {
+        $opt->{test} = substr (($opt->{test}), 0, -3);
+    }
+
+    if (($opt->{test}) =~ / \([0-9][0-9][0-9][0-9]\)$/)
+    {
+        $test_date = substr (($opt->{test}), -5, 4);
+        $test_title = substr (($opt->{test}), 0, -7);
+        print "parsed title is \"$test_title\"\n";
+        print "parsed date is \"$test_date\"\n";
+    }
+    else
+    {
+        $test_title = ($opt->{test});
+        print "parsed title is \"$test_title\"\n";
+        print "no date parsed\n";
+
+    }
+
+    $aug_data =  get_tmdb_augment_data($test_title,$test_date);
+
+    if ($opt->{expire})
+    {
+        print "Expired cache entries for for test string ($opt->{test})\n";
+    }
+    else
+    {
+        if ($aug_data) { print Dumper($aug_data);}
+        else { print "No result parsed from TMDb for test string ($opt->{test})\n"; }
+    }
+
+    Shepherd::Common::log(sprintf "TMDb x-rate-limit max is 40 requests per 10sec. Max usage was %d requests remaining.", $xratelimit_min);
+    Shepherd::Common::print_stats($progname, $version, $script_start_time, %stats);
+
+    $opt->{no_cache} = $remember_cache_switch;
+    &save_cache unless ($opt->{no_cache});
+
+    exit(0);
+}

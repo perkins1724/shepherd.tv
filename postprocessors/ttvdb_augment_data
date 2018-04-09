@@ -1,0 +1,1611 @@
+#!/usr/bin/env perl
+
+# The TV Database (TheTVDb) XMLTV data augmenter
+# "This product uses the TheTVDb API but is not endorsed or certified by TheTVDb."
+#
+#  * to be used as a postprocessor for XMLTV data
+#  * uses The TV Database (https://www.thetvdb.org) to augment TV guide data;
+#  * this should only be used for non-commercial use.
+#  * use of this data augmenter requires an API key which is built in. Misuse of
+#    this data augmenter may result in the API key being blocked. Please act
+#    responsibly.
+#  * use of this data augmenter requires a personal ID key. To obtain a key please
+#    visit https://www.thetvdb.com and create an account. Once your account has been
+#    verified navigate to the account page and copy down your ID key. With your key,
+#    execute this file with the switch --import_id_key="YOUR_PERSONAL_ID_KEY". Misuse of
+#    this data augmenter may result in the ID key being blocked. Please act
+#    responsibly.
+#  * this program will store your key inside the cache for future requests for data from
+#    TheTVDb. However the key is not secured and the cache is not secured. You should
+#    check the security implications of this and take the necessary personal steps to
+#    safeguard your key.
+#  * TheTVDb depends on user contributions. If you use this data augmenter please also
+#    consider contributing.
+#  * please follow the TheTVDb terms and conditions.
+#  * can be used in conjunction with 'shepherd' XMLTV reconciler or standalone
+#    (pipe-through)
+#
+#  initial version based mostly on the aged IMDB XMLTV data augmenter
+#
+#  changelog:
+#    0.01 25feb17 coming soon
+#    0.2 10th Mar 2017   - version step
+#    0.3 13th Mar 2017   - version step
+#    0.4 13th Mar 2017   - version step
+#    0.5 13th Mar 2017   - internal
+#    0.6 15th Mar 2017   - better handle failed website requests. encoding. logic.
+#    0.7 15th Mar 2017   - internal
+#    0.8 15th Mar 2017   - encoding
+#    0.9 16th Mar 2017   - encoding. bypass on webfail. experimental imdb / xmltv_ns episode override
+#    1.0 17th Mar 2017   - fix xmltv_ns overwrite / delete logic
+#    1.1 18th Mar 2017   - new subtitle search algorithm
+#    1.2 19th Mar 2017   - improved logging
+#
+#  todo:
+#
+
+
+use strict;
+use warnings;
+
+my $progname = "test_ttvdb_augment_data";
+my $version = "1.2";
+
+use Getopt::Long;
+use Encode;
+
+use Data::Dumper;
+use JSON;
+
+
+### these are new modules
+use XML::Twig;
+use Time::Local;
+
+
+use Shepherd::Common;
+
+########################################################################
+# initial setup
+########################################################################
+
+my $script_start_time = time;
+my $last_checked = $script_start_time;
+my %stats;
+my $series_cache;
+my $twig= new XML::Twig( keep_encoding => 1, keep_atts_order => 1);
+my $ua;
+my $API_KEY = "B796D0AAB156C05E";
+my $program;
+my $fh;
+my $xratelimit_min = 40;
+my ($program_hits, $cache_hits, $website_hits, $programs_updated, $programs_skipped_duration, $programs_skipped_no_sub, $not_program, $programs_skipped_title_override, $program_not_matched, $subtitle_is_date, $bypassed_progs, $split_sub_cnt, $split_sub_cnt_total) = (0) x 13;
+my @augmentation_list;
+my @augmentation_list_new_title;
+my @rejected_not_sane;
+my @match_not_found;
+my $auth_token;
+my $sep = "/"; # this is the character used as separator between subtitles
+my $cnt_of_sep = 0;
+my $web_not_found = 0; # counter to try and distinguish 404 not found from 522 timeout so that if they are down the program doesn't run for ever.
+#my $api_endpoint = "https://api.thetvdb.com/";
+my $api_endpoint = "https://tvdb2.plex.tv/";
+my $api_endpoint_functioning = 1;
+
+$| = 1;
+
+#
+# parse command line
+#
+
+my $opt = { };
+$opt->{output_file} =		"output.xmltv";
+$opt->{series_cache} =		"series_data";
+$opt->{lang} = 			"en";
+$opt->{debug} =			0;
+$opt->{min_duration} =		0;	# 0 mins
+$opt->{max_duration} =		2;	# 2 hours
+$opt->{skip_categories} = 	"Infotainment,Shopping,Business and Finance,Game Show,News,Parliament,Current Affairs,sports,Sport,Weather,Reality,Movie";
+$opt->{title_overrides} =       "Station Close,Bargain Hunt,Extra,Insiders";
+$opt->{cache_details_for} =	3;	# base cache validity in days. Note - invalid matches have a hardcoded additional delay.
+$opt->{cache_expiry_spread} = 	4;	# rng an expiry spread so total cache doesnt always expire at the same time and to try and avoid thetvdb.com outages.
+
+
+GetOptions(
+	'region=i'		=> \$opt->{region},		# ignored
+	'days=i'		=> \$opt->{days},		# ignored
+	'offset=i'		=> \$opt->{offset},		# ignored
+	'timezone=s'		=> \$opt->{timezone},		# ignored
+	'channels_file=s' 	=> \$opt->{channels_file},	# ignored
+	'config-file=s'		=> \$opt->{configfile},		# ignored
+
+        'min_duration=i'        => \$opt->{min_duration},
+        'max_duration=i'        => \$opt->{max_duration},
+	'skip-categories=s'	=> \$opt->{skip_categories},
+        'title-overrides=s'     => \$opt->{title_overrides},
+	'cache_details_for=i' 	=> \$opt->{cache_details_for},
+	'cache_expiry_spread=i'	=> \$opt->{cache_expiry_spread},
+
+        'username=s'            => \$opt->{username},
+        'account-identifier=s'  => \$opt->{identifier},
+
+	'output=s'		=> \$opt->{output_file},
+	'series-cache=s'	=> \$opt->{series_cache},
+	'no-cache'		=> \$opt->{no_cache},
+	'debug+'		=> \$opt->{debug},
+	'lang=s'		=> \$opt->{lang},		# ignored, left here to strip from ARGV in case Shepherd calls with it
+        'no-retry'              => \$opt->{dont_retry},		# ignored, left here to strip from ARGV in case Shepherd calls with it
+	'help'			=> \$opt->{help},
+        'test'                  => \$opt->{test},
+        'test-title=s'          => \$opt->{test_title},
+        'test-subtitle=s'       => \$opt->{test_subtitle},
+	'test-imdb=s'		=> \$opt->{test_imdb},
+        'expire'                => \$opt->{expire},
+	'set=s'			=> \$opt->{set},		# ignored, left here to strip from ARGV in case Shepherd calls with it
+	'verbose'		=> \$opt->{debug},
+	'version'		=> \$opt->{version},
+	'ready'			=> \$opt->{ready},
+	'desc'			=> \$opt->{desc},
+	'v'			=> \$opt->{version});
+
+printf "%s v%s\n",$progname,$version;
+
+if ($opt->{version} || $opt->{desc} || $opt->{help} || $opt->{ready} ||
+    $opt->{output_file} eq "") {
+	printf "Augments XMLTV data with program information from ".
+	  "The TV Database (www.thetvdb.com)\n" if $opt->{desc};
+
+	printf "$progname is ready for operation.\n" if ($opt->{ready});
+
+	printf "No --output file specified.\n" if ($opt->{output_file} eq "");
+
+	if ($opt->{help} || $opt->{output_file} eq "") {
+		print<<EOF
+
+usage: $0 [options] {FILE(s)}
+
+This product uses the TheTVDb API but is not endorsed or certified by TheTVDb.
+
+The TV Database (TheTVDb) is a free and open sourced TV show database.
+TheTVDb is entirely crowd sourced, therefore postprocessors like this one only function as effectively as the data
+that is provided by volunteers. If you want to support this postprocessor please consider creating an account 
+at www.thetvdb.com and becoming an active contributor.
+
+Supported options include:
+  --min_duration={min}		ignore programs under {min} duration (default: $opt->{min_duration} min)
+  --max_duration={hrs}		ignore programs over {hrs} duration (default: $opt->{max_duration} hours)
+  --skip-categories={list}	don't try to look up programs in these categories (default: $opt->{skip_categories})
+  --title-overrides={list}      skip programs with titles exactly matching (default: $opt->{title_overrides})
+
+  --cache_details_for={days}	cache program details for {days} (default: $opt->{cache_details_for} days)
+  --cache_expiry_spread={days}	spread cache expiry times randomly over additional 0 to {days} (default: $opt->{cache_expiry_spread} days)
+
+  --lang={lang}			set language to {lang} (default: $opt->{lang})
+  --output={file}		send final XMLTV output to {file} (default: $opt->{output_file})
+  --debug			enable debugging
+
+  --series-cache={name}		local name to use as our series cache, will be stored in the directory the program is executed from (default: $opt->{series_cache})
+  --no-cache			don't use local cache, each request required will be sent to TheTVDb
+
+  --test			operate in 'test mode', requires (--test-title or --test-imdb) and --test-subtitle. --output is ignored.
+  --test-title                  requires --test-subtitle. Title to be searched for.
+  --test-imdb                   requires --test-subtitle. Title to be searched for using imdb number (tt1234567).
+  --test-subtitle               requires --test-title or --test-imdb. Subtitle to be searched for. Can be multiple subtitles using '/' as a separator.
+  --expire                      manually force the cache to expire entries that are in the same code path as the --test switch.
+                                useful mainly for debugging without having to rebuild the whole cache (which can be very very slow).
+                                must be used with --test. --output is ignored. requires --series-cache or will imply default $opt->{series_cache}.
+EOF
+;
+	}
+	exit(0);
+}
+
+# set defaults
+Shepherd::Common::set_default("debug", ((defined $opt->{debug} && $opt->{debug} > 0) ? 2 : 0));
+Shepherd::Common::set_default("stats", \%stats);
+Shepherd::Common::set_default("retry_delay", "2-5");
+Shepherd::Common::set_default("delay", "2-5");
+Shepherd::Common::set_default('fake' => 0);
+
+if (!($opt->{username})) { print "This postprocessor requires an account at https://thetvdb.com/ to operate. Please create an account and rerun with --username\n"; exit(0); }
+if (!($opt->{identifier})) { print "This postprocessor requires an account at https://thetvdb.com/ to operate. Please create an account and rerun with --account-identifier and the account identifier from the account page\n"; exit(0); }
+if (($opt->{expire}) && ($opt->{no_cache})) { print "Option --expire cannot be used with --no-cache, Fatal\n"; exit(255); }
+if (($opt->{expire}) && !($opt->{test})) { print "Option --expire requires the use of --test, Fatal\n"; exit(255); }
+if (($opt->{test}) && !($opt->{test_subtitle})) { print "Option --test requires the use of --test-subtitle, Fatal\n"; exit(255); }
+if (($opt->{test_title}) && !($opt->{test_subtitle})) { print "Option --test-title requires the use of --test-subtitle, Fatal\n"; exit(255); }
+if (($opt->{test_imdb}) && !($opt->{test_subtitle})) { print "Option --test-imdb requires the use of --test-subtitle, Fatal\n"; exit(255); }
+if (($opt->{test_subtitle}) && !(!($opt->{test_title}) || !($opt->{test_imdb}))) { print "Option --test-subtitle requires the use of either --test-title or --test-imdb, Fatal\n"; exit(255); }
+
+#&prepare_cache unless ($opt->{no_cache});
+&restore_cache unless ($opt->{no_cache});
+&run_test if (defined $opt->{test});
+
+Shepherd::Common::log(sprintf "\n");
+Shepherd::Common::log(sprintf "This product uses the TheTVDb API but is not endorsed or certified by TheTVDb.");
+Shepherd::Common::log(sprintf "\n");
+Shepherd::Common::log(sprintf "The TV Database (TheTVDb) is a free and open sourced TV show database.");
+Shepherd::Common::log(sprintf "TheTVDb is entirely crowd sourced, therefore postprocessors like this one only function as effectively as the data");
+Shepherd::Common::log(sprintf "that is provided by volunteers. If you want to support this postprocessor please consider creating an account");
+Shepherd::Common::log(sprintf "at www.thetvdb.com and becoming an active contributor.");
+Shepherd::Common::log(sprintf "\n");
+
+
+Shepherd::Common::log(sprintf "started: cache %s, %soutput %s",
+        ($opt->{no_cache} ? "disabled" : "enabled"),
+        ($opt->{debug} ? "debug enabled, " : ""),
+        ($opt->{output_file}));
+
+if (scalar(@ARGV) == "0") {Shepherd::Common::log(sprintf "No input file provided, exiting."); exit;}
+
+foreach my $file (@ARGV) {
+        Shepherd::Common::log(sprintf "Parsing: %s", ($file));
+        $twig->parsefile( $file );
+}
+
+my $root= $twig->root;           # get the root of the twig
+
+my @programs = $root->children;    # get the program list
+PROGRAM: foreach $program (@programs)     # the unsorted list
+{
+    my $aug_data;
+    my $elt;
+    my $found_xmltv_ns = undef;
+    my $found_imdb_ns = undef;
+
+    if ( (time - $last_checked) > 120)
+    {
+        Shepherd::Common::log(sprintf "Progress update - run %d seconds - Processed %d programs, sought data from a website %d times, updated %d programs",
+             time - $script_start_time,
+             $program_hits,
+             $website_hits,
+             $programs_updated);
+        $last_checked = time;
+    }
+
+    if ($program->first_child_text('title') eq "")
+    {
+        $not_program++;
+        printf ("Program element has no title child, most likely a channel definition \(particular if it is at the top\). Skipping.\n") if ($opt->{debug});
+        next PROGRAM; # No title must be channel or something else leave it alone.
+    }
+    $program_hits++;
+
+    if (!$program->has_child('sub-title'))
+    {
+        $programs_skipped_no_sub++;
+        print ("Found no subtitle child. Skipping \"" . $program->first_child_text('title') . ".\"\n") if ($opt->{debug});
+        next PROGRAM; # no subtitle, nothing worth working with, skip. Got to start somewhere
+    }
+
+    $cnt_of_sep = () = $program->has_child('sub-title')->text =~ /\Q$sep/g;
+    if (length($program->has_child('sub-title')) lt 11 && $cnt_of_sep == 2)
+    {
+        print ("Subtitle length is " . length($program->has_child('sub-title')) . " and number of seperators is $cnt_of_sep so assuming it is a date, skipping\n") if ($opt->{debug});
+        $subtitle_is_date++;
+        next PROGRAM; # No point trying to process a date as a subtitle.
+    }
+
+
+    foreach $elt ($program->first_child->next_siblings('episode-num'))
+    {
+        if ($elt->att("system") eq "xmltv_ns")
+        {
+            $found_xmltv_ns = $elt->text;
+        }
+        if ($elt->att("system") eq "imdb.com")
+        {
+            $found_imdb_ns = $elt->text;
+            $found_imdb_ns =~ s#title/##g;
+        }
+    }
+
+    if ($program->has_child('length')) {
+        if ($program->first_child('length')->{'att'}->{'units'} eq "minutes") {
+            if (($program->first_child('length')->text) < $opt->{min_duration}) {
+                printf ("Program length less than " . $opt->{min_duration} . "minutes. Skipping \"" . $program->first_child_text('title') . "\".\n") if ($opt->{debug});
+                $programs_skipped_duration++; next PROGRAM; }}}
+
+    if ($program->has_child('length')) {
+        if ($program->first_child('length')->{'att'}->{'units'} eq "hours") {
+            if (($program->first_child('length')->text) > $opt->{max_duration}) {
+                printf ("Program length greater than " . $opt->{max_duration} . "hours. Skipping \"" . $program->first_child_text('title') . "\".\n") if ($opt->{debug});
+                $programs_skipped_duration++; next PROGRAM; }}}
+
+    if ($program->has_child('category')) {
+        foreach $elt ($program->first_child->next_siblings('category'))
+        {
+            foreach my $skip_category (split(/,/,$opt->{skip_categories})) {
+                if (lc($elt->text_only) eq lc($skip_category)) {
+                    $stats{skipped_due_to_category}++;
+                    printf ("Found matching category exclusion of \"" . lc($elt->text_only) . "\". Skipping \"" . $program->has_child('title')->text . "\".\n") if ($opt->{debug});
+                    next PROGRAM; # if it matches exclusion list, skip it.
+                }
+            }
+        }
+    }
+
+    foreach my $title_overrides (split(/,/,$opt->{title_overrides})) {
+        if (lc($program->first_child_text('title')) eq lc($title_overrides)) {
+            printf ("Found matching title exclusion of \"" . lc($title_overrides) . "\". Skipping \"" . $program->has_child('title')->text . "\".\n") if ($opt->{debug});
+            $programs_skipped_title_override++; next PROGRAM; # if it matches exclusion list, skip it.
+        }
+    }
+
+    my $remember_program = $program;
+
+    $aug_data = get_ttvdb_augment_data($program->first_child('title')->text, $program->first_child_text('sub-title'), $found_imdb_ns);
+
+    if ((!$aug_data) && ($found_xmltv_ns) && ($found_imdb_ns) && ($cnt_of_sep == 0))
+    {
+        $aug_data = get_fallback_ttvdb_augment_data($found_imdb_ns, $found_xmltv_ns);
+    }
+
+
+    if (!$aug_data)
+    {
+        $program_not_matched++;
+        push @match_not_found, (sprintf "Failed to match program with starttime %s and channel %s and title \"%s\" and sub-title \"%s\"",
+                $remember_program->{'att'}->{'start'},
+                $remember_program->{'att'}->{'channel'},
+                $remember_program->first_child_text('title'),
+                $remember_program->first_child_text('sub-title'));
+        next PROGRAM;
+    }
+
+    $cnt_of_sep = (scalar(@{$aug_data}) - 1); # count of seperators needs to be related to the returned array size now in case of discrepancies.
+
+    # before go any further need to get some revised start / stop times for the elements that are being split
+    my $starttime = $program->att('start');
+    my $endtime = $program->att('stop');
+    my $timezone = ""; 
+    my @matched_starttime;
+    my @matched_endtime;
+    $timezone = substr($starttime, 14, length($starttime)) if (length($starttime) > 14);
+    $starttime = substr($starttime, 0, 14);
+    $endtime = substr($endtime, 0, 14);
+
+    my @t = $starttime =~ m!(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})!;
+    $t[1]--;
+    my $timestamp = timelocal 0,@t[4,3,2,1,0];
+    my $unix_starttime = $timestamp;
+    @t = $endtime =~ m!(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})!;
+    $t[1]--;
+    $timestamp = timelocal 0,@t[4,3,2,1,0];
+    my $unix_endtime = $timestamp;
+    my $unix_duration = $unix_endtime - $unix_starttime;
+    $unix_duration = int $unix_duration / ($cnt_of_sep + 1);
+
+    my $index_counter = 0;
+    push(@matched_starttime, $program->att('start'));
+    while ($index_counter lt $cnt_of_sep)
+    {
+        $unix_starttime = $unix_starttime + $unix_duration;
+        my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($unix_starttime);
+        $year += 1900;
+        $mon++;
+        my $formatted_time = sprintf("%04d", $year) . sprintf("%02d", $mon) . sprintf("%02d", $mday) . sprintf("%02d", $hour) . sprintf("%02d", $min) . sprintf("%02d", $sec) . $timezone;
+# I bet there is a problem here when change of daylight savings occurs.....
+        push(@matched_endtime, $formatted_time);
+        push(@matched_starttime, $formatted_time);
+        $index_counter++;
+    }
+    push(@matched_endtime, $program->att('stop'));
+
+    my $revised_length;
+    if ($program->has_child('length'))
+    {
+        if ($program->first_child('length')->{'att'}->{'units'} eq "hours") { $revised_length = ($program->first_child('length')->text * 60); }
+        elsif ($program->first_child('length')->{'att'}->{'units'} eq "minutes") { $revised_length = ($program->first_child('length')->text); }
+        elsif ($program->first_child('length')->{'att'}->{'units'} eq "seconds") { $revised_length = ($program->first_child('length')->text / 60); }
+        $revised_length = int($revised_length / ($cnt_of_sep + 1));
+    }
+
+    foreach my $make_new_prog (reverse @{$aug_data})
+    {
+        my $cp = $program->copy();
+
+        print ("Will augment entry for " . $cp->has_child('title')->text . " - " . $cp->has_child('sub-title')->text . ".\n") if ($opt->{debug});
+
+
+        # XMLTV absolutely (ABSOLUTELY) enforces ordering, so the following structure is important.
+        # starting to regret not using the xmltv module maybe?
+
+        # if star rating scrub all star rating and add star rating
+        if ($make_new_prog->{'siteRating'})
+        {
+            foreach $elt ($cp->first_child->next_siblings('star-rating'))
+            {
+                $elt->delete;
+            }
+            $cp->insert_new_elt('first_child', 'star-rating');
+            $cp->first_child('star-rating')->insert_new_elt('first_child', 'value' => $make_new_prog->{'siteRating'});
+        }
+        else
+        {
+            foreach $elt ($cp->first_child->next_siblings('star-rating'))
+            {
+                $elt->move('first_child',$cp);
+            }
+        }
+
+        # next comes the rating. Lets keep the old rating unless there is no rating
+        if ($cp->first_child->next_sibling_text('rating'))
+        {
+            foreach $elt ($cp->first_child->next_siblings('rating'))
+            {
+                $elt->move('first_child',$cp);
+            }
+        }
+        elsif ($make_new_prog->{'rating'})
+        {
+            foreach $elt ($cp->first_child->next_siblings('rating'))
+            {
+                $elt->delete;
+            }
+            $cp->insert_new_elt('first_child', 'rating');
+            $cp->first_child('rating')->set_att("system", "unknown");
+            $cp->first_child('rating')->insert_new_elt('first_child', 'value' => $make_new_prog->{'rating'});
+        }
+
+        # next comes the subtitles.  We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('subtitles'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes new. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('new'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes last-chance. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('last-chance'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes premiere. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('premiere'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes previously-shown. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('previously-shown'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes audio. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('audio'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes video. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('video'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes episode-num.
+        # scrub all onscreen elements as they are essentially meaningless.
+        # logic assumes must be a series if xmltv_ns or onscreen systems are present.
+        # "themoviedb.org", "thetvdb.com" and "imdb.com" systems should parse correctly with mythtv
+
+        my $found_ttvdb_ns_ele = 0;
+        my $found_imdb_ns_ele = 0;
+        my $found_xmltv_ns_ele = 0;
+
+        foreach $elt ($cp->first_child->next_siblings('episode-num'))
+        {
+            if (lc($elt->{'att'}->{'system'}) eq "onscreen")
+            {
+                $elt->delete;
+            }
+            elsif (lc($elt->{'att'}->{'system'}) eq "themoviedb.org") # hows that for a bad sign......
+            {
+                printf "we are updating %s - %s that has an existing themoviedb.org tag.\n", $cp->has_child('title')->text, $cp->has_child('sub-title')->text;
+                print "Someone somewhere got something wrong... lets assume it was someone else and keep going.\n";
+                $elt->delete;
+            }
+            elsif (lc($elt->{'att'}->{'system'}) eq "thetvdb.com")
+            {
+                $found_ttvdb_ns_ele = 1;
+                if(lc($elt->text) eq ("series/" . $make_new_prog->{'ttvdb_id'}))
+                {
+                    $elt->move('first_child',$cp);
+                }
+                else
+                {
+                    printf "we are updating %s - %s that has a different thetvdb.com tag.\n", $cp->has_child('title')->text, $cp->has_child('sub-title')->text;
+                    print "Someone somewhere got something wrong... lets assume it was someone else and keep going.\n";
+                    $elt->delete;
+                    if ($make_new_prog->{'ttvdb_id'} && ($found_ttvdb_ns_ele < 2))
+                    {
+                        $cp->insert_new_elt('first_child', 'episode-num' => "series/" . $make_new_prog->{'ttvdb_id'});
+                        $cp->first_child('episode-num')->set_att("system", "thetvdb.com");
+                    }
+                }
+            }
+            elsif (lc($elt->{'att'}->{'system'}) eq "imdb.com")
+            {
+                $found_imdb_ns_ele++;
+                if(lc($elt->text) eq ("title/" . $make_new_prog->{'imdb'}))
+                {
+                    $elt->move('first_child',$cp);
+                }
+                else
+                {
+                    printf "we are updating %s - %s that has a different imdb.com tag.\n", $cp->has_child('title')->text, $cp->has_child('sub-title')->text;
+                    printf "old imdb.com tag is %s, new imdb.com tag is %s\n", lc($elt->text), ("title/" . $make_new_prog->{'imdb'});
+                    print "Someone somewhere got something wrong... lets assume it was someone else and keep going.\n";
+                    $elt->delete;
+                    if ($make_new_prog->{'imdb'} && ($found_imdb_ns_ele < 2))
+                    {
+                        $cp->insert_new_elt('first_child', 'episode-num' => "title/" . $make_new_prog->{'imdb'});
+                        $cp->first_child('episode-num')->set_att("system", "imdb.com");
+                    }
+                }
+            }
+            elsif (lc($elt->{'att'}->{'system'}) eq "xmltv_ns")
+            {
+                $found_xmltv_ns_ele++;
+                if (defined($make_new_prog->{'season_num'}) && defined($make_new_prog->{'episode_num'}) && ($found_xmltv_ns_ele < 2))
+                {
+                    $cp->insert_new_elt('first_child', 'episode-num' => (($make_new_prog->{'season_num'} - 1) . "." . ($make_new_prog->{'episode_num'} - 1) . "."));
+                    $cp->first_child('episode-num')->set_att("system", "xmltv_ns");
+                    $elt->delete;
+                }
+                else
+                {
+                    $elt->delete;
+                }
+            }
+            else
+            {
+                $elt->delete;
+            }
+        }
+        if ($found_ttvdb_ns_ele == 0)
+        {
+            $cp->insert_new_elt('first_child', 'episode-num' => "series/" . $make_new_prog->{'ttvdb_id'});
+            $cp->first_child('episode-num')->set_att("system", "thetvdb.com");
+        }
+        if ($found_imdb_ns_ele == 0)
+        {
+            $cp->insert_new_elt('first_child', 'episode-num' => "title/" . $make_new_prog->{'imdb'});
+            $cp->first_child('episode-num')->set_att("system", "imdb.com");
+        }
+        if (($found_xmltv_ns_ele == 0) && defined($make_new_prog->{'season_num'}) && defined($make_new_prog->{'episode_num'}))
+        {
+            $cp->insert_new_elt('first_child', 'episode-num' => (($make_new_prog->{'season_num'} - 1) . "." . ($make_new_prog->{'episode_num'} - 1) . "."));
+            $cp->first_child('episode-num')->set_att("system", "xmltv_ns");
+        }
+
+        # next comes country. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('country'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes url. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('url'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes icon. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('icon'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes length.
+        if ($revised_length)
+        {
+            if ($cnt_of_sep == 0)
+            {
+                foreach $elt ($cp->first_child->next_siblings('length'))
+                {
+                    $elt->move('first_child',$cp);
+                }
+            }
+            else
+            {
+                foreach $elt ($cp->first_child->next_siblings('length'))
+                {
+                    $elt->delete;
+                    $cp->insert_new_elt('first_child', 'length' => $revised_length);
+                    $cp->first_child('length')->set_att("units", "minutes");
+                }
+            }
+        }
+        else
+        {
+            foreach $elt ($cp->first_child->next_siblings('length'))
+            {
+                $elt->move('first_child',$cp);
+            }
+        }
+
+
+        # next comes orig-language. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('orig-language'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes language. We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('language'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes category.
+        # if have some categories scrub all genres and add genres
+        if (scalar(@{$make_new_prog->{'category'}}) > 0)
+        {
+            foreach $elt ($cp->first_child->next_siblings('category'))
+            {
+                $elt->delete;
+            }
+
+            # add an element to flag this program as type Series
+            $cp->insert_new_elt('first_child', 'category' => "Series" );
+            $cp->first_child('category')->set_att("lang", "en");
+
+            foreach my $augment_data_split_genre (@{$make_new_prog->{'category'}})
+            {
+                $cp->insert_new_elt('first_child', 'category' => $augment_data_split_genre);
+                $cp->first_child('category')->set_att("lang", "en");
+            }
+        }
+        else # move existing categories to top
+        {
+            foreach $elt ($cp->first_child->next_siblings('category'))
+            {
+                if (lc($elt->text) eq lc("Series"))
+                {
+                    $elt->delete;
+                }
+            }
+            $cp->insert_new_elt('first_child', 'category' => "Series" );
+            $cp->first_child('category')->set_att("lang", "en");
+            my $print_once = 0;
+            foreach $elt ($cp->first_child->next_siblings('category'))
+            {
+                if (lc($elt->text) eq lc("Series"))
+                {
+                    next;
+                }
+                if ($print_once == 0)
+                {
+                    printf "\nWe **believe** we found a match to \"%s - %s\" on TheTVDb. But we could not find any categories.\n", $remember_program->first_child_text('title'), $remember_program->first_child_text('sub-title');
+                    print "The match might be wrong. If not, the guide data contains the following categories. If they are accurate\n";
+                    print "please consider creating an account at TheTVDb and contributing to the database. If all the categories below\n";
+                    print "are generic like \"Movie\" or \"Series\" (instead of like \"Comedy\") then they can be safely ignored.\n";
+                    $print_once++;
+                }
+                print $elt->text, "\n";
+                $elt->move('first_child',$cp);
+            }
+        }
+
+        # next comes date.  We dont have so move to top.
+        foreach $elt ($cp->first_child->next_siblings('date'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes credits. We dont have, thetvdb just lumps all actors against the parent series and just too many to deal with. Omitting for now
+        foreach $elt ($cp->first_child->next_siblings('credits'))
+        {
+            $elt->move('first_child',$cp);
+        }
+
+        # next comes description.
+        # scrub all descriptions and add description
+        if ($make_new_prog->{'desc'})
+        {
+            foreach $elt ($cp->first_child->next_siblings('desc'))
+            {
+                $elt->delete;
+            }
+            $cp->insert_new_elt('first_child', 'desc' => $make_new_prog->{'desc'});
+            $cp->first_child('desc')->set_att("lang", "en");
+        }
+        else
+        {
+            my $print_once = 0;
+            foreach $elt ($cp->first_child->next_siblings('desc'))
+            {
+                if ($print_once == 0)
+                {
+                    printf "\nWe **believe** we found a match to \"%s - %s\" on ttvdb. But we could not find any description\n", $remember_program->first_child_text('title'), $make_new_prog->{'name'};
+                    print "Note: This can happen when splitting sub-titles if only some of the sub-title splits were successful matches.\n";
+                    print "The guide data contains the following description. If it is accurate please consider creating\n";
+                    print "an account at ttvdb and contributing to the database.\n";
+                    $print_once++;
+                }
+                print ($elt->text . "\n");
+                $elt->move('first_child',$cp);
+            }
+        }
+
+        # next comes subtitle. Write out new sub-titles.
+        if ($make_new_prog->{'name'})
+        {
+            foreach $elt ($cp->first_child->next_siblings('sub-title'))
+            {
+                $elt->delete;
+            }
+            $cp->insert_new_elt('first_child', 'sub-title' => $make_new_prog->{'name'});
+            $cp->first_child('sub-title')->set_att("lang", "en");
+        }
+        else
+        {
+            foreach $elt ($cp->first_child->next_siblings('sub-title'))
+            {
+                $elt->move('first_child',$cp);
+            }
+        }
+
+        # delete all titles and insert the new title at the top
+        # scrub all titles and add title
+        if ($make_new_prog->{'seriesName'})
+        {
+            foreach $elt ($cp->first_child->next_siblings('title'))
+            {
+                $elt->delete;
+            }
+            $cp->insert_new_elt('first_child', 'title' => $make_new_prog->{'seriesName'});
+            $cp->first_child('title')->set_att("lang", "en");
+        }
+        else
+        {
+            my $print_once = 0;
+            foreach $elt ($cp->first_child->next_siblings('title'))
+            {
+                if ($print_once == 0)
+                {
+                    print "\n*********************found a blank title, bad bad bad*******************\n";
+                    printf "We stuffed up and found a match to \"%s - %s\" on ttvdb. But we could not find any title\n", $remember_program->first_child_text('title'), $remember_program->first_child_text('sub-title');
+                    print "The guide data contains the following title. We will try harder next time, but please feel free to\n";
+                    print "report this title on the shepherd forums and hopefully someone will work out what went wrong.\n";
+                    $print_once++;
+                }
+                print ($elt->text . "\n");
+                $elt->move('first_child',$cp);
+            }
+        }
+
+        # and last of all correct the start and stop times if needed.
+        $cp->set_att('start', pop(@matched_starttime));
+        $cp->set_att('stop', pop(@matched_endtime));
+
+
+        $programs_updated++;
+
+        print ("   Augmented entry for " . $remember_program->first_child_text('title') . ".\n") if ($opt->{debug});
+
+        if (($cp->first_child_text('title') eq $remember_program->first_child_text('title')) && ($cp->first_child_text('sub-title') eq $remember_program->first_child_text('sub-title')))
+        {
+            push @augmentation_list, (sprintf "Augmented program with starttime %s and channel %s and title \"%s\" and sub-title \"%s\"", 
+                $cp->{'att'}->{'start'},
+                $cp->{'att'}->{'channel'},
+                $remember_program->first_child_text('title'),
+                $remember_program->first_child_text('sub-title'))
+        }
+        else
+        {
+            push @augmentation_list_new_title, (sprintf "Augmented program at starttime %s and channel %s.
+     from title \"%s\"
+       to title \"%s\"
+          from subtitle \"%s\"
+            to subtitle \"%s\"",
+                $remember_program->{'att'}->{'start'},
+                $remember_program->{'att'}->{'channel'},
+                $remember_program->first_child_text('title'),
+                $cp->first_child_text('title'),
+                $remember_program->first_child_text('sub-title'),
+                $cp->first_child_text('sub-title'));
+        }
+        $cp->paste( after => $program, $root);
+    }
+
+    $program->cut;
+}
+
+
+open ($fh, '>', $opt->{output_file}) or die "unable to open $opt->{output_file} for writing: $!";
+binmode($fh, ":encoding(Latin1)") || die "can't binmode to encoding Latin1";
+$twig->print($fh, keep_atts_order => 1, pretty_print => 'indented', twig_print_outside_roots => 1); # this prints to the filehandle
+close ($fh);
+
+$opt->{debug} = 1;
+print "\n\n" if ($opt->{debug});
+print ("Exactly matched the following program list\n") if ($opt->{debug});
+print Dumper(@augmentation_list) if ($opt->{debug});
+print "\n\n" if ($opt->{debug});
+print ("Rejected supplied matches from ttvdb for the following program list\n") if ($opt->{debug});
+print Dumper(@rejected_not_sane) if ($opt->{debug});
+print "\n\n" if ($opt->{debug});
+print ("Determined a match for the following program list\n") if ($opt->{debug});
+print Dumper(@augmentation_list_new_title) if ($opt->{debug});
+print "\n\n" if ($opt->{debug});
+print ("Failed to match the following program list\n") if ($opt->{debug});
+print Dumper(@match_not_found) if ($opt->{debug});
+print "\n\n" if ($opt->{debug});
+
+Shepherd::Common::log(sprintf "Processed a total of %s programs", $program_hits);
+Shepherd::Common::log(sprintf "Utilised cache %s times.", $cache_hits);
+Shepherd::Common::log(sprintf "Sought data from a website %s times", $website_hits);
+Shepherd::Common::log(sprintf "Updated %s programs", $programs_updated);
+Shepherd::Common::log(sprintf "%d programs skipped due to duration, %d skipped due to no subtitle, %d skipped due to category.",
+    $programs_skipped_duration, $programs_skipped_no_sub, $stats{skipped_due_to_category});
+Shepherd::Common::log(sprintf "%d programs skipped for title override exclusion", $programs_skipped_title_override);
+Shepherd::Common::log(sprintf "%d entries were not considered programs", $not_program);
+Shepherd::Common::log(sprintf "Split %d program entries into %d", $split_sub_cnt, $split_sub_cnt_total);
+Shepherd::Common::log(sprintf "Failed to match %d programs", $program_not_matched);
+Shepherd::Common::print_stats($progname, $version, $script_start_time, %stats);
+
+&save_cache unless ($opt->{no_cache});
+
+exit(0);
+
+
+########################################################################
+# functions
+########################################################################
+
+
+sub restore_cache
+{
+    print "Restoring cache.\n";
+    $series_cache = Shepherd::Common::read_cache($opt->{'series_cache'});
+
+    my $counter = 0;
+
+    foreach (keys %$series_cache)
+    {
+        if ($series_cache->{$_}->{'expiry'} < ($script_start_time - (60 * 60 * 27))) # expire when expiry time is 27hrs in the past
+        {
+            delete $series_cache->{$_};
+        }
+    }
+    print "Restored cache.\n";
+}
+
+
+sub save_cache
+{
+    print "Saving cache.\n";
+    Shepherd::Common::write_cache($opt->{'series_cache'}, $series_cache);
+}
+
+
+sub flush_to_cache
+{
+    Shepherd::Common::write_cache($opt->{'series_cache'}, $series_cache);
+    $series_cache = Shepherd::Common::read_cache($opt->{'series_cache'});
+}
+
+
+sub prepare_cache
+{
+    Shepherd::Common::log(sprintf "linking to cache %s",
+        ($opt->{series_cache}));
+#    $series_cache = CHI->new( driver => 'File',
+#        'root_dir' => cwd(),
+#        'namespace' => ($opt->{series_cache}),
+#        'label' => ($opt->{series_cache}) );
+}
+
+
+sub get_page
+{
+    my ($url) = @_;
+    my %cnf;
+    my $ret;
+
+    if (!$auth_token)
+    {
+        $cnf{url} = sprintf "%slogin", $api_endpoint;
+        $cnf{method} = "POST";
+        $cnf{postvars} = "{\"apikey\": \"$API_KEY\", \"username\": \"$opt->{username}\",\"userkey\": \"$opt->{identifier}\"}";
+        $cnf{headers} = [ 'Content-Type: application/json', 'Accept: application/json' ]; 
+        $cnf{retries} = 1;
+        $website_hits++;
+
+        my @response = Shepherd::Common::get_url(%cnf);
+
+        if (!$stats{failed_requests}) {
+            $stats{failed_requests} = 0; }
+        if ($stats{successful_requests} and $stats{failed_requests} > ($stats{successful_requests} + $web_not_found + 3))
+        {
+            printf "Exiting: %d failed network requests vs %d successes.\n",
+                 $stats{failed_requests}, $stats{successful_requests};
+#            print stats(1);
+            die "Too many network failures.";
+        }
+
+        if ($response[2] eq "200 OK")
+        {
+            $ret = $response[0];
+            $ret = JSON::decode_json($ret);
+            $auth_token = $ret->{token};
+            printf "We have been provided with the following authentication token to use: %s.\n", $auth_token;
+        }
+        else
+        {
+            print $response[2], "\n";
+            print "Failed to obtain authentication token. Disabling API endpoint.\n";
+            $api_endpoint_functioning = 0;
+            return
+#            exit(255);
+        }
+    }
+
+    $cnf{url} = $url;
+    $cnf{method} = "GET";
+    $cnf{postvars} = "";
+    $cnf{retries} = 0;
+    my $auth_header_string = sprintf "Authorization: Bearer %s", $auth_token;
+    $cnf{headers} = [ 'Accept: application/json', $auth_header_string ];
+
+    my $last_web_return_code;
+    for (my $i=0; $i <= 3; $i++) {
+        $website_hits++;
+        my @response = Shepherd::Common::get_url(%cnf);
+        if (!$stats{failed_requests}) {
+            $stats{failed_requests} = 0; }
+        if ($stats{successful_requests} and $stats{failed_requests} > ($stats{successful_requests} + $web_not_found + 3))
+        {
+            printf "Exiting: %d failed network requests vs %d successes.\n",
+                 $stats{failed_requests}, $stats{successful_requests};
+#            print stats(1);
+            die "Too many network failures.";
+        }
+
+        if ($response[2] eq "404 Not Found")
+        {
+            $web_not_found++;
+            return;
+        }
+        elsif ($response[2] eq "200 OK")
+        {
+            my $ret = $response[0];
+#            encode_entities($ret,'&');
+            $ret =~ s/&nbsp;/ /g if ($ret);
+            $ret =~ s#\’#\'#g if ($ret);
+            $ret =~ s#\‘#\'#g if ($ret);
+            $ret =~ s#\–#\-#g if ($ret);
+            $ret =~ s#\“#\'#g if ($ret);
+            $ret =~ s#\‟#\'#g if ($ret);
+            $ret =~ s#\”#\'#g if ($ret);
+            $ret =~ s#\Č#C#g if ($ret);
+            $ret =~ s#\ć#c#g if ($ret);
+            $ret =~ s#\—#\-#g if ($ret);
+            $ret =~ s#…#...#g if ($ret);
+            $ret =~ s#ō#o#g if ($ret);
+            $ret =~ s#€#\$#g if ($ret);
+            $ret =~ s#&amp;#&#g if ($ret);
+            $ret =~ s#&#&amp;#g if ($ret);
+            $ret =~ s#\\u0026#&amp;#g;
+            $ret =~ s#\\u201f#\'#g;
+            $ret =~ s#\\u2026#...#g;
+            $ret =~ s#\\u014d#o#g;
+            $ret =~ s#\\u20ac#\$#g;
+            return $ret;
+        }
+        else
+        {
+            $last_web_return_code = $response[2];
+            print $response[2], "\n";
+            sleep 10;
+            next;
+        }
+    }
+    print $last_web_return_code, " occured too many times, disabling API endpoint.\n";
+    $api_endpoint_functioning = 0;
+    return
+#    exit(255);
+}
+
+sub refresh_ua
+{
+    print "Refreshing UA.\n" if ($opt->{debug});
+    if ($ua)
+    {
+       print stats() if ($opt->{debug} and $opt->{stats});
+       print "Sleeping...\n" if ($opt->{debug});
+       sleep_for(5 + int(rand(20)));
+    }
+
+    $ua = Shepherd::Common::setup_ua( cookie_jar => 1 );
+}
+
+sub ttvdb_search_for_series
+{
+    my ($search_title, $search_imdb_ns) = @_;
+
+    # the goal is to find a single ttvdb series id populated with all episodes. if cant get a single match then return its all over
+
+    my $url;
+    my $ttvdb_id;
+    my %output;
+    
+    if ($search_imdb_ns)
+    {
+        $url = sprintf "%ssearch/series?imdbId=%s", $api_endpoint, $search_imdb_ns;
+    }
+    else
+    {
+        my $safe_search_title = $search_title;
+        $safe_search_title =~ s# #\%20#g;
+        $safe_search_title =~ s#'#\%27#g;
+        $safe_search_title =~ s#!#\%21#g;
+        $safe_search_title =~ s#\##\%23#g;
+        $safe_search_title =~ s#&amp;#\%26#g;
+        $safe_search_title =~ s#&#\%26#g;
+        $url = sprintf "%ssearch/series?name=%s", $api_endpoint, $safe_search_title;
+    }
+
+    my $search_result = get_page($url);
+
+    if (not $search_result)
+    {
+        return;
+    }
+
+    my $search_json = JSON::decode_json($search_result);
+    if ($search_json->{error})
+    {
+        return;
+    }
+
+    foreach my $search_result_series ($search_json->{data}[0])
+    {
+        if (!$ttvdb_id)
+        {
+            $ttvdb_id = $search_result_series->{id};
+        }
+        else # we have multiple matches and no way of resolving
+        {
+            # cache something so that we dont keep looking and looking and looking for unresolvable values
+            if ($search_imdb_ns)
+            {
+                my $expire_time = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60 * 5)) + ($opt->{cache_details_for} * 24 * 60 * 60 * 5)) + $script_start_time); # cache 'too many hits' for 5 times longer than a single hit
+                %output = ();
+                $output{'id'} = "999999999";
+                $output{'expiry'} = $expire_time;
+                if ($opt->{expire}) { delete $series_cache->{$search_imdb_ns}; }
+                else { $series_cache->{$search_imdb_ns} = {%output} if not ($opt->{no_cache}); }
+                flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+            }
+            else
+            {
+                my $expire_time = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60 * 5)) + ($opt->{cache_details_for} * 24 * 60 * 60 * 5)) + $script_start_time); # cache 'too many hits' for 5 times longer than a single hit
+                %output = ();
+                $output{'id'} = "999999999";
+                $output{'expiry'} = $expire_time;
+                if ($opt->{expire}) { delete $series_cache->{$search_title}; }
+                else { $series_cache->{$search_title} = {%output} if not ($opt->{no_cache}); }
+                flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+            }
+            return;
+        }
+    }
+
+    if ($search_imdb_ns) # this statement sequence will cache a mapping from imdb reference or title reference to ttvdb id so dont need to seek it again in future.
+    {
+        my $expire_time = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60)) + ($opt->{cache_details_for} * 24 * 60 * 60)) + $script_start_time);
+        %output = ();
+        $output{'id'} = $ttvdb_id;
+        $output{'expiry'} = $expire_time;
+        if ($opt->{expire}) { delete $series_cache->{$search_imdb_ns}; }
+        else { $series_cache->{$search_imdb_ns} = {%output} if not ($opt->{no_cache}); }
+        flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+    }
+    else
+    {
+        my $expire_time = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60)) + ($opt->{cache_details_for} * 24 * 60 * 60)) + $script_start_time);
+        %output = ();
+        $output{'id'} = $ttvdb_id;
+        $output{'expiry'} = $expire_time;
+        if ($opt->{expire}) { delete $series_cache->{$search_title}; }
+        else { $series_cache->{$search_title} = {%output} if not ($opt->{no_cache}); }
+        flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+    }
+
+
+    # if we made it this far we have a single ttvdb id for the series we want. time to get the details
+    %output = ();
+
+    $url = sprintf "%sseries/%d", $api_endpoint, $ttvdb_id;
+
+    $search_result = get_page($url);
+
+    if (not $search_result)
+    {
+        return;
+    }
+
+    $search_json = JSON::decode_json($search_result);
+
+    $output{'seriesName'} = $search_json->{data}->{seriesName};
+    $output{'ttvdb_id'} = $search_json->{data}->{id};
+
+    my @genre_array;
+
+    foreach my $find_genre (@{$search_json->{data}{genre}})
+    {
+        unshift @genre_array, $find_genre;
+    }
+
+    $output{'genre'} = \@genre_array;
+
+    $output{'rating'} = $search_json->{data}->{rating};
+
+    $output{'imdb'} = $search_json->{data}->{imdbId};
+
+    if ( $search_json->{data}->{siteRatingCount} > 10)
+    {
+        $output{'siteRating'} = $search_json->{data}->{siteRating} . "/10";
+    }
+
+    # we have the series level detail. time to get the episodes
+
+    $output{'episodes'} = ttvdb_get_episodes($ttvdb_id);
+
+    if ($opt->{expire}) { delete $series_cache->{$ttvdb_id}; }
+    else { $output{'expiry'} = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60)) + ($opt->{cache_details_for} * 24 * 60 * 60)) + $script_start_time); $series_cache->{$ttvdb_id} = {%output} if not ($opt->{no_cache}); }
+    flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+
+    return %output;
+}
+
+sub ttvdb_get_episodes
+{
+
+    my ($ttvdb_id) = @_;
+    my $url = sprintf "%sseries/%d/episodes?page=%d", $api_endpoint, $ttvdb_id, "1";
+    my $search_result = get_page($url);
+    my @output_array;
+
+    if (not $search_result)
+    {
+        return;
+    }
+
+    my $search_json = JSON::decode_json($search_result);
+
+    foreach my $import_episodes (@{$search_json->{'data'}})
+    {
+        my %episode_element;
+        $episode_element{'episode_num'} = $import_episodes->{airedEpisodeNumber};
+        $episode_element{'season_num'} = $import_episodes->{airedSeason};
+        $episode_element{'name'} = $import_episodes->{episodeName};
+        $episode_element{'name'} =~ s# *$## if (defined($import_episodes->{episodeName}));
+        $episode_element{'desc'} = $import_episodes->{overview};
+        $episode_element{'desc'} =~ s# *$## if (defined($import_episodes->{overview}));
+        push (@output_array, \%episode_element);
+    }
+
+    if ($search_json->{links}->{last} > 1)
+    {
+        for (my $multi_page_index=2; $multi_page_index <= $search_json->{links}->{last}; $multi_page_index++)
+        {
+            $url = sprintf "%sseries/%d/episodes?page=%d", $api_endpoint, $ttvdb_id, $multi_page_index;
+            $search_result = get_page($url);
+            if (not $search_result)
+            {
+                print "Some sort of fundamental error\n";
+                return;
+            }
+            $search_json = JSON::decode_json($search_result);
+            foreach my $next_import_episodes (@{$search_json->{'data'}})
+            {
+                my %next_episode_element;
+                $next_episode_element{'episode_num'} = $next_import_episodes->{airedEpisodeNumber};
+                $next_episode_element{'season_num'} = $next_import_episodes->{airedSeason};
+                $next_episode_element{'name'} = $next_import_episodes->{episodeName};
+                $next_episode_element{'name'} =~ s# *$## if (defined($next_import_episodes->{episodeName}));
+                $next_episode_element{'desc'} = $next_import_episodes->{overview};
+                $next_episode_element{'desc'} =~ s# *$## if (defined($next_import_episodes->{overview}));
+                push (@output_array, \%next_episode_element);
+            }
+        }
+    }
+    return \@output_array;
+}
+
+
+
+sub get_ttvdb_augment_data
+{
+    # from a provided title, subtitle and imdb number
+    # return hash of augment parameters
+    # return empty if not able to find exact match
+
+    my ($search_title, $search_subtitle, $search_imdb_ns) = @_;
+    my %output;
+
+    if (not $opt->{no_cache})
+    {
+        # first need to convert the imdb number or program title into a ttvdb series is
+        my $ttvdb_series_id;
+        if ($search_imdb_ns)
+        {
+            $ttvdb_series_id = $series_cache->{$search_imdb_ns}->{id} if ($series_cache->{$search_imdb_ns}->{id});
+            $cache_hits++ if ($series_cache->{$search_imdb_ns}->{id});
+        }
+        else
+        {
+            $ttvdb_series_id = $series_cache->{$search_title}->{id} if ($series_cache->{$search_title}->{id});
+            $cache_hits++ if ($series_cache->{$search_title}->{id});
+        }
+
+        if ($ttvdb_series_id)
+        {
+            return if ($ttvdb_series_id == "999999999");
+            %output = %{$series_cache->{$ttvdb_series_id}} if ($series_cache->{$ttvdb_series_id});
+            $cache_hits++ if ($series_cache->{$ttvdb_series_id});
+        }
+    }
+
+    if ((not %output) && $api_endpoint_functioning)
+    {
+        %output = ttvdb_search_for_series($search_title, $search_imdb_ns);
+    }
+
+    if ((not %output) && $api_endpoint_functioning)
+    {
+        # cache something so that we dont keep looking and looking and looking for unresolvable values
+        if ($search_imdb_ns)
+        {
+            my $expire_time = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60 * 5)) + ($opt->{cache_details_for} * 24 * 60 * 60 * 5)) + $script_start_time); # cache 'nothing found' for 5 times longer than a hit
+            %output = ();
+            $output{'id'} = "999999999";
+            $output{'expiry'} = $expire_time;
+            if ($opt->{expire}) { delete $series_cache->{$search_imdb_ns}; }
+            else { $series_cache->{$search_imdb_ns} = {%output} if not ($opt->{no_cache}); }
+            flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+        }
+        else
+        {
+            my $expire_time = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60 * 5)) + ($opt->{cache_details_for} * 24 * 60 * 60 * 5)) + $script_start_time); # cache 'nothing found' for 5 times longer than a hit
+            %output = ();
+            $output{'id'} = "999999999";
+            $output{'expiry'} = $expire_time;
+            if ($opt->{expire}) { delete $series_cache->{$search_title}; }
+            else { $series_cache->{$search_title} = {%output} if not ($opt->{no_cache}); }
+            flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+        }
+        return;
+    }
+
+    if (not %output)
+    {
+        return;
+    }
+
+    # at this point $output holds all the possible series and episode data from whatever we determined was a match for the details provided.
+    my $multi_match_crosscheck = 0;
+
+    my %ret_element = find_subtitle_in_ttvdb_title_array($search_subtitle,@{$output{'episodes'}});
+    if (%ret_element)
+    {
+        my @ret_array;
+        $ret_element{'category'} = $output{'genre'} if (defined($output{'genre'}));
+        $ret_element{'rating'} = $output{'rating'} if (defined($output{'rating'}));
+        $ret_element{'imdb'} = $output{'imdb'} if (defined($output{'imdb'}));
+        $ret_element{'siteRating'} = $output{'siteRating'} if (defined($output{'siteRating'}));
+        $ret_element{'seriesName'} = $output{'seriesName'} if (defined($output{'seriesName'}));
+        $ret_element{'ttvdb_id'} = $output{'ttvdb_id'} if (defined($output{'ttvdb_id'}));
+        push (@ret_array, \%ret_element);
+        return \@ret_array;
+    }
+
+    my $alt_subtitle = $search_subtitle;
+    my @ret_array;
+    $alt_subtitle =~ s# /#/#g;
+    $alt_subtitle =~ s#/ #/#g;
+
+    $cnt_of_sep = () = $alt_subtitle =~ /\Q$sep/g;
+
+    $multi_match_crosscheck = 0;
+    if ($cnt_of_sep > 0)
+    {
+        OUTER: foreach my $comp_search_subtitles (split /$sep/, $alt_subtitle)
+        {
+            my %ret_element = find_subtitle_in_ttvdb_title_array($comp_search_subtitles,@{$output{'episodes'}});
+            if (%ret_element)
+            {
+                $multi_match_crosscheck++;
+                $ret_element{'category'} = \@{$output{'genre'}} if (defined($output{'genre'}));
+                $ret_element{'rating'} = $output{'rating'} if (defined($output{'rating'}));
+                $ret_element{'imdb'} = $output{'imdb'} if (defined($output{'imdb'}));
+                $ret_element{'siteRating'} = $output{'siteRating'} if (defined($output{'siteRating'}));
+                $ret_element{'seriesName'} = $output{'seriesName'} if (defined($output{'seriesName'}));
+                $ret_element{'ttvdb_id'} = $output{'ttvdb_id'} if (defined($output{'ttvdb_id'}));
+                push (@ret_array, \%ret_element);
+                printf "Success. Found a match on split subtitle, %s - %s.\n", $search_title, $comp_search_subtitles if ($opt->{debug});
+                next OUTER;
+            }
+
+            printf "Did not find a match on split subtitle, %s - %s.\n", $search_title, $comp_search_subtitles if ($opt->{debug});
+
+            $ret_element{'season_num'} = undef();
+            $ret_element{'episode_num'} = undef();
+            $ret_element{'desc'} = undef();
+            $ret_element{'name'} = $comp_search_subtitles;
+            $ret_element{'category'} = $output{'genre'} if (defined($output{'genre'}));
+            $ret_element{'rating'} = $output{'rating'} if (defined($output{'rating'}));
+            $ret_element{'imdb'} = $output{'imdb'} if (defined($output{'imdb'}));
+            $ret_element{'siteRating'} = $output{'siteRating'} if (defined($output{'siteRating'}));
+            $ret_element{'seriesName'} = $output{'seriesName'} if (defined($output{'seriesName'}));
+            $ret_element{'ttvdb_id'} = $output{'ttvdb_id'} if (defined($output{'ttvdb_id'}));
+            push (@ret_array, \%ret_element);
+        }
+        print "Failure. Found too many matches" if (($multi_match_crosscheck > ($cnt_of_sep + 1)) && ($opt->{debug}));
+        printf "found %d matches from %d subtitle elements. Search has ended.\n", $multi_match_crosscheck, ($cnt_of_sep + 1) if ($opt->{debug});
+        return if ($multi_match_crosscheck > ($cnt_of_sep + 1)); # return empty if too many matches
+        $split_sub_cnt++;
+        $split_sub_cnt_total = $split_sub_cnt_total + ($cnt_of_sep + 1);
+        return \@ret_array if ($multi_match_crosscheck > 0); # return with matches if any valid matches
+    }
+    printf "Failure. Did not find a match on subtitle, %s - %s. Search has ended.\n", $search_title, $search_subtitle if ($opt->{debug});
+    return;
+}
+
+
+sub find_subtitle_in_ttvdb_title_array
+{
+    my ($search_subtitle, @ttvdb_title_array) = @_;
+    my $multi_match_crosscheck = 0;
+    my %ret_element;
+    my $tmp_string;
+
+    my @alternate_subtitles;
+    push (@alternate_subtitles, $search_subtitle);
+    $tmp_string = $search_subtitle; $tmp_string =~ s#/#,#g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "/" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s# &amp; ##g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, " &amp; " ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s# and ##g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, " and " ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s# & ##g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, " & " ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string  =~ s#The Octonauts and t#T#g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "The Octonauts and t" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string  =~ s#The Octonauts And T#T#g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "The Octonauts And T" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string  =~ s#\(1\)#Part 1#g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "\(1\)" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s#\(2\)#Part 2#g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "\(2\)" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s#\(3\)#Part 3#;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "\(3\)" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s#\(4\)#Part 4#g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "\(4\)" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s#\(1\)##g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "\(1\)" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s#\(2\)##g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "\(2\)" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s#\(3\)##g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "\(3\)" ) != -1);
+    $tmp_string = $search_subtitle; $tmp_string =~ s#\(4\)##g;
+    push (@alternate_subtitles, $tmp_string) if (index($search_subtitle, "\(4\)" ) != -1);
+
+    foreach my $alternate_subtitle (@alternate_subtitles)
+    {
+        foreach my $comp_subtitles (@ttvdb_title_array)
+        {
+            if($comp_subtitles->{'name'})
+            {
+                my $mangle_search = mangle_for_compare($alternate_subtitle);
+                my $mangle_compare = mangle_for_compare($comp_subtitles->{name});
+                if ($mangle_search eq $mangle_compare)
+                {
+                    $multi_match_crosscheck++;
+                    $ret_element{'season_num'} = $comp_subtitles->{'season_num'} if (defined($comp_subtitles->{'season_num'}));
+                    $ret_element{'episode_num'} = $comp_subtitles->{'episode_num'} if (defined($comp_subtitles->{'episode_num'}));
+                    $ret_element{'desc'} = $comp_subtitles->{'desc'} if (defined($comp_subtitles->{'desc'}));
+                    $ret_element{'name'} = $comp_subtitles->{'name'} if (defined($comp_subtitles->{'name'}));
+                }
+            }
+        }
+
+        if ($multi_match_crosscheck == 1)
+        {
+            printf "Success. Found a single match on subtitle, %s.\n", $alternate_subtitle if ($opt->{debug});
+            return %ret_element; # we found a match on whole subtitle so we are done
+        }
+        elsif ($multi_match_crosscheck > 1)
+        {
+            printf "Failure. Found multiple matches for subtitle, %s. Only 1 match permitted.\n", $alternate_subtitle if ($opt->{debug});
+            return; # can only permit a single match at this point so we are done
+        }
+    }
+    printf "Failed. Found no matches across all mangled subtitle combinations, original subtitle was %s.\n", $search_subtitle if ($opt->{debug});
+    return; # no matches end of the line
+
+}
+
+
+sub mangle_for_compare
+{
+    my ($mangle_string) = @_;
+    $mangle_string = lc($mangle_string);
+    $mangle_string =~ s# &amp; ##g;
+    $mangle_string =~ s# and ##g;
+    $mangle_string =~ s# & ##g;
+    $mangle_string =~ s#[ ]##g;
+    $mangle_string =~ s#[']##g;
+    $mangle_string =~ s#[!]##g;
+    $mangle_string =~ s#[\?]##g;
+    $mangle_string =~ s#[.]##g;
+    $mangle_string =~ s#[,]##g;
+    $mangle_string =~ s#[\#]##g;
+    $mangle_string =~ s#[:]##g;
+    $mangle_string =~ s#[;]##g;
+    $mangle_string =~ s#[-]##g;
+    return $mangle_string;
+}
+
+
+sub get_fallback_ttvdb_augment_data
+{
+    # from a provided title, subtitle and imdb number
+    # return hash of augment parameters
+    # return empty if not able to find exact match
+
+    my ($search_imdb_ns, $search_xmltv_ns) = @_;
+    my %output;
+
+    if (not $opt->{no_cache})
+    {
+        # first need to convert the imdb number into a ttvdb series
+        my $ttvdb_series_id;
+        if ($search_imdb_ns)
+        {
+            $ttvdb_series_id = $series_cache->{$search_imdb_ns}->{id} if ($series_cache->{$search_imdb_ns}->{id});
+            $cache_hits++ if ($series_cache->{$search_imdb_ns}->{id});
+        }
+
+        if ($ttvdb_series_id)
+        {
+            return if ($ttvdb_series_id == "999999999");
+            %output = %{$series_cache->{$ttvdb_series_id}} if ($series_cache->{$ttvdb_series_id});
+            $cache_hits++ if ($series_cache->{$ttvdb_series_id});
+        }
+    }
+
+    if ((not %output) && $api_endpoint_functioning)
+    {
+        %output = ttvdb_search_for_series(undef(), $search_imdb_ns);
+    }
+
+    if ((not %output) && $api_endpoint_functioning)
+    {
+        # cache something so that we dont keep looking and looking and looking for unresolvable values
+        if ($search_imdb_ns)
+        {
+            my $expire_time = (((int rand ($opt->{cache_expiry_spread} * 24 * 60 * 60 * 5)) + ($opt->{cache_details_for} * 24 * 60 * 60 * 5)) + $script_start_time); # cache 'nothing found' for 5 times longer than a hit
+            %output = ();
+            $output{'id'} = "999999999";
+            $output{'expiry'} = $expire_time;
+            if ($opt->{expire}) { delete $series_cache->{$search_imdb_ns}; }
+            else { $series_cache->{$search_imdb_ns} = {%output} if not ($opt->{no_cache}); }
+            flush_to_cache if not ($opt->{no_cache} || $opt->{expire} || $opt->{test});
+        }
+        return;
+    }
+
+    if (not %output)
+    {
+        return;
+    }
+
+    # at this point $output holds all the possible series and episode data from whatever we determined was a match for the details provided.
+    my @ret_array;
+
+    my ($search_season, $search_episode) = parse_xmltv_ns($search_xmltv_ns);
+
+    my $multi_match_crosscheck = 0;
+    foreach my $loop_elements (@{$output{episodes}})
+    {
+        if(($loop_elements->{'season_num'} == $search_season) && ($loop_elements->{'episode_num'} == $search_episode))
+        {
+            $multi_match_crosscheck++;
+            my %ret_element;
+            $ret_element{'season_num'} = $loop_elements->{'season_num'} if (defined($loop_elements->{'season_num'}));
+            $ret_element{'episode_num'} = $loop_elements->{'episode_num'} if (defined($loop_elements->{'episode_num'}));
+            $ret_element{'desc'} = $loop_elements->{'desc'} if (defined($loop_elements->{'desc'}));
+            $ret_element{'name'} = $loop_elements->{'name'} if (defined($loop_elements->{'name'}));
+            $ret_element{'category'} = $output{'genre'} if (defined($output{'genre'}));
+            $ret_element{'rating'} = $output{'rating'} if (defined($output{'rating'}));
+            $ret_element{'imdb'} = $output{'imdb'} if (defined($output{'imdb'}));
+            $ret_element{'siteRating'} = $output{'siteRating'} if (defined($output{'siteRating'}));
+            $ret_element{'seriesName'} = $output{'seriesName'} if (defined($output{'seriesName'}));
+            $ret_element{'ttvdb_id'} = $output{'ttvdb_id'} if (defined($output{'ttvdb_id'}));
+            push (@ret_array, \%ret_element);
+        }
+    }
+
+    if ($multi_match_crosscheck == 1)
+    {
+        printf "\n\nSuccess.***EXPERIMENTAL*** Found a match on original imdb_ns and xmltv_ns, %s - %s.\n", $search_imdb_ns, $search_xmltv_ns if ($opt->{debug});
+        printf "Show was title %s and subtitle %s\n\n", $ret_array[0]->{'seriesName'}, $ret_array[0]->{'name'} if ($opt->{debug});
+        return \@ret_array; # we found a match so we are done
+    }
+    elsif ($multi_match_crosscheck > 1)
+    {
+        printf "Failure. Found multiple matches for a single imdb_ns and xmltv_ns pair, %s - %s. Only 1 match permitted. Search has ended.\n", $search_imdb_ns, $search_xmltv_ns if ($opt->{debug});
+        return; # can only permit a single match at this point so we are done
+    }
+
+    printf "Failed to find a match on original imdb_ns and xmltv_ns pair, %s - %s. Search has ended.\n", $search_imdb_ns, $search_xmltv_ns if ($opt->{debug});
+    return;
+}
+
+
+sub parse_xmltv_ns
+{
+    my ($search_xmltv_ns) = @_;
+    $search_xmltv_ns =~ s# ##g;
+    my @xmltv_ns_split = split(/\./,$search_xmltv_ns);
+
+    return ($xmltv_ns_split[0] + 1), ($xmltv_ns_split[1] + 1);
+}
+
+sub run_test
+{
+    my $test_title;
+    my $test_subtitle;
+    my $test_imdb;
+    my $aug_data;
+    my $remember_cache_switch = $opt->{no_cache};
+
+    # no-cache needs to be set to touch the cache using the same code paths as set cache. But felt it was counter-intuitive
+    # to require the user to set no-cache when clearing elements. So handle in code instead.
+    if ($opt->{expire})
+    {
+        $opt->{no_cache} = 1;
+    }
+
+    $test_title = ($opt->{test_title});
+    $test_subtitle = ($opt->{test_subtitle});
+    $test_imdb = ($opt->{test_imdb});
+
+    $aug_data =  get_ttvdb_augment_data($test_title,$test_subtitle,$test_imdb);
+
+    if ($opt->{expire})
+    {
+        print "Expired cache entries if found.\n";
+    }
+    else
+    {
+        if ($aug_data)
+        {
+            foreach my $augment_data (@{$aug_data})
+            {
+                print Dumper $augment_data;
+            }
+        }
+        else
+        {
+            print "No result parsed from ttvdb.\n";
+        }
+    }
+
+    Shepherd::Common::print_stats($progname, $version, $script_start_time, %stats);
+
+    $opt->{no_cache} = $remember_cache_switch;
+    &save_cache unless ($opt->{no_cache});
+
+    exit(0);
+}
