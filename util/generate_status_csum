@@ -1,0 +1,36 @@
+#!/usr/bin/perl
+
+# helper server script:
+#  takes a 'status' file and augments it with two additional fields
+#  containing a checksum of (component).conf and (component)
+
+# designed to be run with:
+#   cd (webserver_directory_with_tree_checked_out)
+#   generate_status_csum < status > status.csum
+
+use Digest::SHA;
+
+while (<>) {
+	chop;
+	print $_;
+
+	if ($_ =~ /(\S+)\s+(\S+)\s+(\S+)/g) {
+		my ($progtype, $proggy, $latestversion) = ($1,$2,$3);
+
+		my $fname = $progtype."s/".$proggy;
+		&print_csum("$fname.conf");
+		&print_csum("$fname");
+	}
+	print "\n";
+}
+exit(0);
+
+
+sub print_csum
+{
+	my $fname = shift;
+	my $sha = Digest::SHA->new();
+
+	$sha->addfile($fname) or die "Unable to add file $fname to SHA hash: $!";
+	printf "\t%s",$sha->hexdigest;
+}

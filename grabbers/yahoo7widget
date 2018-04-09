@@ -1,0 +1,663 @@
+#!/usr/bin/env perl
+
+# yahoo7_widget au_tv guide grabber - runs from "Shepherd" master grabber
+#  * written by ltd
+#  * uses yahoo7 widget for ABC/7/9/10/SBS (all they have)
+#  * when used in conjunction with Shepherd, shepherd can collect other channels
+#    using other grabbers
+#  * this does NOT use any config file - all settings are passed in from shepherd
+
+#  changelog:
+#    1.50  22sep06	added support for "shepherd" master grabber script
+#    1.51  02oct06      --ready option
+#    1.52  03oct06      split out yahoo7 grabber into its own grabber
+#    1.54  16oct06      put date/cast/credits/year into correct xmltv fields
+#    1.70  15dec06	sometimes there are holes in data; augment those from yahoo7web
+#    1.78  04feb07	remove augmenting - micrograbbing from other grabbers
+#			can now fill those in
+#    1.80  22feb07	bugfix: stop throwing away multiple category data
+#    1.81  01mar07      more informative error on no connectivity
+#    2.00  19jun10	moved to JSON data format
+#    2.01  20jun10	add sub-title support in
+#    2.10  22jun10	experimental: drop JSON module for cut-down Shepherd::json_pp
+
+use strict;
+use warnings;
+
+my $progname = "yahoo7widget";
+my $version = "2.44";
+
+use XMLTV;
+use POSIX qw(strftime mktime);
+use Getopt::Long;
+use Data::Dumper;
+use Shepherd::Common;
+use Shepherd::json_pp;  # use JSON;
+
+#
+# some initial cruft
+#
+
+my $script_start_time = time;
+my %stats;
+my $channels, my $opt_channels;
+my $tv_guide;
+my $input_xml;
+my $d;
+$| = 1;
+
+# Map yahoo paytv names to what shepherd knows them as.
+# Format: 'yahoo7widget name' => 'official name'
+my %paytv_fixups = (
+    '111' => '111funny',
+    '1112' => '111funny2',
+#    '13THSTREET' => '13THSTREET',
+    '13THSTREET2' => '13thSTREET2',
+    '13THSTREETHD' => '13thStreetHD',
+#    'ACC' => 'ACC',
+#    'Action' => 'Action',
+#    'Action2' => 'Action2',
+#    'ActionHD' => 'ActionHD',
+#    'AdultsOnly960' => 'AdultsOnly960',
+#    'AE' => 'AE',
+#    'AE2' => 'AE2',
+#    'AEHD' => 'AEHD',
+    'AlJazeeraEnglish' => 'AlJazeera',
+#    'AnimalPlanet' => 'AnimalPlanet',
+    'Antenna' => 'AntennaPacific',
+    'ARENA' => 'Arena',
+    'ARENA2' => 'Arena2',
+    'ARENAHD' => 'ArenaHD',
+#    'Arts' => 'Arts',
+#    'ArtsHD' => 'ArtsHD',
+    'AURORA' => 'Aurora',
+#    'BBCFirst' => 'BBCFirst',
+#    'BBCFirstHD' => 'BBCFirstHD',
+#    'BBCKnowledge' => 'BBCKnowledge',
+#    'BBCKnowledgeHD' => 'BBCKnowledgeHD',
+#    'BBCWorldNews' => 'BBCWorldNews',
+    'beINSports1' => 'beINSPORTS1',
+#    'beINSPORTS1HD' => 'beINSPORTS1HD',
+#    'beINSPORTS2' => 'beINSPORTS2',
+#    'beINSPORTS2HD' => 'beINSPORTS2HD',
+#    'beINSPORTS3' => 'beINSPORTS3',
+#    'beINSPORTS3HD' => 'beINSPORTS3HD',
+#    'Binge' => 'Binge',
+#    'BingeHD' => 'BingeHD',
+#    'Bio' => 'Bio',
+    'Bloomberg' => 'BloombergTelevision',
+    'BOOMERANG' => 'Boomerang',
+    'Boxsets' => 'BoxSets',
+    'BoxsetsHD' => 'BoxSetHD',
+    'CARTOONNETWORK' => 'CartoonNetwork',
+    'BBCCBeebies' => 'Cbeebies',
+#    'CCD' => 'CCD',
+    'CCTV-9Documentary' => 'CCTV9Doco',
+#    'CCTVNews' => 'CCTVNews',
+    'ChelseaFCTV' => 'ChelseaTV',
+    'ChelseaFCTVHD' => 'ChelseaTVHD',
+#    'CMC' => 'CMC',
+#    'CNBC' => 'CNBC',
+#    'CNN' => 'CNN',
+#    'Comedy' => 'Comedy',
+#    'ComedyHD' => 'ComedyHD',
+    'THECOMEDYCHANNEL' => 'TheComedyChannel',
+    'THECOMEDYCHANNEL2' => 'ComedyCh2',
+    'CrimeInvestigation' => 'Crime',
+#    'Daystar' => 'Daystar',
+    'DiscoveryChannel2' => 'Discovery2',
+#    'DiscoveryChannel' => 'DiscoveryChannel',
+#    'DiscoveryHD' => 'DiscoveryHD',
+#    'DiscoveryHealth' => 'DiscoveryHealth',
+#    'DiscoveryKids' => 'DiscoveryKids',
+#    'DiscoveryScience' => 'DiscoveryScience',
+#    'DiscoveryTurbo' => 'DiscoveryTurbo',
+#    'DiscoveryTurbo2' => 'DiscoveryTurbo2',
+    'DisneyMovies2' => 'DisneyMov2',
+#    'DisneyChannel' => 'DisneyChannel',
+#    'DisneyJunior' => 'DisneyJunior',
+#    'DisneyXD' => 'DisneyXD',
+    'E!' => 'E!Entertainment',
+#    'ESPN' => 'ESPN',
+#    'ESPN2' => 'ESPN2',
+#    'ESPNHD' => 'ESPNHD',
+    'ESPN2 HD' => 'ESPN2HD',
+#    'Eurosport' => 'Eurosport',
+#    'EurosportHD' => 'EurosportHD',
+    'EurosportNews' => 'Eurosportnews',
+#    'EXPO' => 'EXPO',
+#    'Family' => 'Family',
+#    'Family2' => 'Family2',
+#    'FamilyHD' => 'FamilyHD',
+#    'FOX8' => 'FOX8',
+#    'FOX82' => 'FOX82',
+#    'FOX8HD' => 'FOX8HD',
+#    'FOXClassics' => 'FOXClassics',
+#    'FOXClassics2' => 'FOXClassics2',
+    'FOXNEWS' => 'FOXNews',
+    'FOXSPORTS1' => 'FoxSports1',
+    'FOXSPORTS1HD' => 'FoxSports1HD',
+    'FOXSPORTS2' => 'FoxSports2',
+    'FOXSPORTS2HD' => 'FoxSports2HD',
+    'FOXSPORTS3' => 'FoxSports3',
+    'FOXSPORTS3HD' => 'FoxSports3HD',
+    'FOXSPORTS4' => 'FoxSports4',
+    'FOXSPORTS4HD' => 'FoxSports4HD',
+    'FOXSPORTS5' => 'FoxSports5',
+    'FOXSPORTS5HD' => 'FoxSports5HD',
+    'FOXFOOTY' => 'FoxFooty',
+    'FOXFOOTYHD' => 'FoxFootyHD',
+    'FOXSPORTSNews' => 'FoxSportsNews',
+    'FOXSPORTSNewsHD' => 'FoxSportsNewsHD',
+    'FoxtelMoviesDisneyHD' => 'DisneyMoviesHD',
+    'FoxtelMoviesDisneySD' => 'DisneyMovies',
+#    'FOXSPORTSPLUS' => 'FOXSPORTSPLUS',
+#    'FUELTV' => 'FUELTV',
+#    'FX' => 'FX',
+#    'FX2' => 'FX2',
+#    'FXHD' => 'FXHD',
+#    'KidsCo' => 'KidsCo',
+    'LifestyleHOME' => 'LifestyleHome',
+    'LifestyleChannel' => 'TheLifestyleChannel',
+    'LifestyleChannel2' => 'Lifestyle2',
+    'LifestyleFOOD' => 'LifestyleFOOD',
+    'LifestyleFOOD2' => 'LifestyleFOOD2',
+    'LifestyleHD' => 'LifestyleHD',
+    'LifestyleYOU' => 'LifestyleYOU',
+    'LifestyleYOU2' => 'LifestyleYOU2',
+    'LiverpoolFCTV' => 'LFCTV',
+    'LiverpoolFCTVHD' => 'LFCTVHD',
+#    'MainEvent' => 'MainEvent',
+    'ManchesterUnitedFCTV' => 'MUTV',
+    'ManchUnitedFCTVHD' => 'MUTVHD',
+#    'Masterpiece' => 'Masterpiece',
+#    'MasterpieceHD' => 'MasterpieceHD',
+#    'MAX' => 'MAX',
+    'MoreMovies' => 'FoxtelMoviesMore',
+    'MoreMoviesHD' => 'FoxtelMoviesMoreHD',
+#    'MTV' => 'MTV',
+#    'MTVMusic' => 'MTVMusic',
+#    'MTVDance' => 'MTVDance',
+#    'NatGeo2' => 'NatGeo2',
+#    'NatGeoAdventure' => 'NatGeoAdventure',
+#    'NatGeoHD' => 'NatGeoHD',
+#    'NatGeoPeople' => 'NatGeoPeople',
+#    'NatGeoWild' => 'NatGeoWild',
+#    'NatGeoWildHD' => 'NatGeoWildHD',
+#    'NationalGeographic' => 'NationalGeographic',
+#    'Nickelodeon' => 'Nickelodeon',
+#    'NickJr' => 'NickJr',
+#    'NITV' => 'NITV',
+    'NHK' => 'NHKWorld',
+#    'Ovation' => 'Ovation',
+#    'Premiere' => 'Premiere',
+#    'Premiere2' => 'Premiere2',
+#    'PremiereHD' => 'PremiereHD',
+    'RAI' => 'RAIITALIA',
+#    'Romance' => 'Romance',
+#    'RomanceHD' => 'RomanceHD',
+#    'RussiaToday' => 'RussiaToday',
+#    'SetantaSports' => 'SetantaSports',
+    'Showcase' => 'showcase',
+    'Showcase2' => 'showcase2',
+    'ShowcaseHD' => 'showcaseHD',
+    'SkyNewsBusiness' => 'SKYNewsBusiness',
+#    'SkyBusinessHD' => 'SkyBusinessHD',
+    'SkyNewsAustralia' => 'SKYNewsLive',
+    'SkyNewsHD' => 'SKYNewsHD',
+    'SkyRacing1' => 'SKYRacing',
+    'SkyNewsElection' => 'SKYNewsElection',
+#    'SkyNewsElectionHD' => 'SKYNewsElectionHD',
+    'SkyRacing2' => 'SKYRacing2',
+#    'SKYRacingWorld' => 'SKYRacingWorld',
+    'SkyThoroughbredCentral' => 'SKYTbredCent',
+    'SkyTbredHD' => 'SKYTbredCentHD',
+#    'SKYWeather' => 'SKYWeather',
+#    'SPEED' => 'SPEED',
+#    'SPEEDHD' => 'SPEEDHD',
+    'style.' => 'Style',
+#    'Syfy' => 'Syfy',
+#    'Syfy2' => 'Syfy2',
+#    'SyfyHD' => 'SyfyHD',
+#    'TCM' => 'TCM',
+#    'TheHistoryChannel' => 'TheHistoryChannel',
+    'TheHistoryChannelHD' => 'HistoryHD',
+#    'Thriller' => 'Thriller',
+#    'ThrillerHD' => 'ThrillerHD',
+#    'TLC' => 'TLC',
+#    'TLC2' => 'TLC2',
+#    'TSN' => 'TSN',
+    'TVH!ts' => 'TVH!TS',
+    'TVH!ts2' => 'TVH!TS2',
+#    'TVN' => 'TVN',
+    'TVSNShopping' => 'TVSN',
+#    'UKTV' => 'UKTV',
+#    'UKTV2' => 'UKTV2',
+#    'UKTVHD' => 'UKTVHD',
+    'UniversalChannel' => 'Universal',
+#    'Universal2' => 'Universal2',
+#    'UniversalHD' => 'UniversalHD',
+    'Smooth' => 'FoxtelSmooth',
+    'VHits' => 'VHITS',
+    'VHits2' => 'VHITS2',
+    'WorldMovies' => 'WORLDMOVIES',
+#    'WorldMoviesHD' => 'WorldMoviesHD',
+);
+
+#
+# parse command line
+#
+
+my $opt;
+$opt->{outputfile} = 	"output.xmltv";	# default
+$opt->{days} = 		7;		# default
+$opt->{lang} =		"en";
+$opt->{region} =	94;
+
+GetOptions(
+	'region=i'	=> \$opt->{region},
+	'days=i'	=> \$opt->{days},
+	'offset=i'	=> \$opt->{offset},
+	'paytvtimeoffset:s'	=> \$opt->{paytvoffset},
+	'channels_file=s' => \$opt->{channels_file},
+	'cachefile=s' => \$opt->{obsolete},
+	'output=s'	=> \$opt->{outputfile},
+	'fast'		=> \$opt->{fast},
+	'paytv'		=> \$opt->{paytv},
+	'warper'	=> \$opt->{warper},
+	'lang=s'	=> \$opt->{lang},
+	'obfuscate'	=> \$opt->{obfuscate},
+	'debug+'	=> \$opt->{debug},
+	'help'		=> \$opt->{help},
+	'verbose'	=> \$opt->{help},
+	'version'	=> \$opt->{version},
+	'ready'		=> \$opt->{version},
+	'desc'		=> \$opt->{desc},
+	'v'		=> \$opt->{help});
+
+&help if (defined $opt->{help});
+
+if (defined $opt->{version} || defined $opt->{desc}) {
+	printf "%s %s\n",$progname,$version;
+	printf "%s is a details-aware grabber that collects very high quality data (full title/subtitle/description/genre and year/cast/credits data) using the Yahoo7 website.",$progname if (defined $opt->{desc});
+	exit(0);
+}
+
+# set defaults
+Shepherd::Common::set_default("debug", ($opt->{debug} * 2)) if (defined $opt->{debug});
+Shepherd::Common::set_default("webwarper", 1) if (defined $opt->{warper});
+Shepherd::Common::set_default("squid", 1) if (defined $opt->{obfuscate});
+Shepherd::Common::set_default("referer", "last");
+Shepherd::Common::set_default("retry_delay", 10);
+Shepherd::Common::setup_ua('agent' => 'Mozilla/5.0 (Windows; U; Windows NT 5.1; en-us)');
+
+die "no channel file specified, see --help for instructions\n", unless (defined $opt->{channels_file});
+
+$opt->{days} = 9 if $opt->{days} > 9;	# no data beyond 9 days
+
+#
+# go go go!
+#
+
+my $starttime = $script_start_time;
+
+# correct $starttime to remove gap between local and Eastern States time
+my $local_time_offset;
+
+if (!defined $opt->{paytvoffset} || !($opt->{paytvoffset} =~ m/(\+|-)\d{4}$/o))  {
+        $local_time_offset = POSIX::strftime("%z",localtime(time)); 
+} else { 
+        $local_time_offset = $opt->{paytvoffset}; 
+}
+
+# yahoo7widget times are always localtime on Eastern States ..
+$ENV{TZ}="Australia/Melbourne";
+my $melbourne_time_offset = POSIX::strftime("%z",localtime(time));
+my $time_offset = ((int(substr($melbourne_time_offset,1,2))-int(substr($local_time_offset,1,2)))*(60*60)) +
+                ((int(substr($melbourne_time_offset,3,2))-int(substr($local_time_offset,3,2)))*(60));
+$starttime -= $time_offset;
+
+my $endtime = $starttime + ($opt->{days} * 86400);
+$starttime += (86400 * $opt->{offset}) if (defined $opt->{offset});
+
+Shepherd::Common::log(sprintf "going to grab %d days%s of data into %s (%s%s) region %s",
+	$opt->{days},
+	($opt->{offset} ? " (skipping first $opt->{offset} days)" : ""),
+	$opt->{outputfile},
+	(defined $opt->{fast} ? "with haste" : "slowly"),
+	(defined $opt->{warper} ? ", anonymously" : ""),
+	$opt->{region});
+
+if (-r $opt->{channels_file}) {
+	local (@ARGV, $/) = ($opt->{channels_file});
+	no warnings 'all'; eval <>; die "$@" if $@;
+} else {
+	die "WARNING: channels file $opt->{channels_file} could not be read\n";
+}
+
+&check_for_paytv;
+
+$starttime -= ($starttime % $d->{fetch_interval}); # normalize time window to help yahoo's squid cache entries
+for (my $currtime = $starttime; $currtime < $endtime; $currtime += $d->{fetch_interval}) {
+	# pace ourselves
+	if (($currtime != $starttime) && (!defined $opt->{fast})) {
+		my $sleeptimer = int(rand(5)) + 1;  # sleep anywhere from 1 to 5 seconds
+		$stats{slept_for} += $sleeptimer;
+		sleep $sleeptimer;
+	}
+
+	# get data
+	my $tries = 5;
+	my $url = sprintf "http://au.tv.yahoo.com/tv-guide/data/%d/%d/%d/%d/",
+		$opt->{region},
+		($d->{want_paytv} > 0 ? "168" : "0"),
+		$currtime,
+		($currtime+$d->{fetch_interval});
+	my ($data, $success, $status_msg, $bytes_fetched, $seconds_slept, $failed_attempts, $response) = 
+	  Shepherd::Common::get_url(url => $url, retries => ($tries-1));
+
+	$stats{failed_requests} += $failed_attempts;
+	$stats{slept_for} += $seconds_slept;
+	$stats{bytes_fetched} += $bytes_fetched;
+
+	if ((!$data) || (!$success)) {
+		Shepherd::Common::log("Failed to fetch '$url' after $tries attempts.");
+
+		# if its our first page, abort now
+		if ($currtime == $starttime) {
+			Shepherd::Common::log("Aborting: likely format change or blocked!");
+			exit 10;
+		}
+		next;
+	}
+
+	$stats{http_successful_requests}++;
+	&parse_json_data($data);
+}
+
+&write_data;
+Shepherd::Common::print_stats($progname, $version, $script_start_time, %stats);
+exit(0);
+
+######################################################################################################
+# help
+
+sub help
+{
+	print<<EOF
+$progname $version
+
+$0 [options]
+    options are as follows:
+	--region=N			set region for where to collect data from (default: $opt->{region})
+	--channels_file=file		where to get channel data from (MANDATORY)
+	--days=N			fetch 'n' days of data (default: $opt->{days})
+	--output=file			send xml output to file (default: "$opt->{outputfile}")
+
+	--fast				don't run slow - get data as quick as you can - not recommended
+	--debug				increase debug level
+	--warper			fetch data using WebWarper web anonymizer service
+	--obfuscate			pretend to be a proxy servicing multiple clients
+	--lang=[s]			set language of xmltv output data (default $opt->{lang})
+
+	--paytvtimeoffset		apply an offset between current timezone and AEST for paytv channels
+	--paytvtimeoffset[="+HHMM"]	apply a difference of +HHMM and AEST for paytv channels ie +1030 (+- is mandatory)
+
+EOF
+;
+
+	exit(0);
+}
+
+######################################################################################################
+# parse it into $tv_guide->{$channel}->{data}->{$event_id}-> structures..
+
+sub parse_json_data
+{
+	my $data = shift;
+
+	unless (($data) && (length($data) > 1)) {
+	    print STDERR "ERROR: no data to parse.\n";
+	    return;
+	}
+
+	# my $decoded_data = decode_json($data);
+	my $decoded_data = JSON::cut_down_PP::decode_json($data);
+
+	foreach my $item (@{($decoded_data->{'tv'}->[0]->{'item'})}) {
+		my $event_id = $item->{'event_id'};
+
+		# mandatory fields
+		my $event_start = $item->{'event_date'}->[0]->{timestamp};
+		my $event_end =   $item->{'end_date'}->[0]->{timestamp};
+
+		if ($event_start < 10) {
+			$stats{progs_with_invalid_start}++;
+			printf "WARNING: programme with event_id '$event_id' had an invalid start time of '$event_start'; skipped\n";
+			next;
+		}
+		if ($event_end < 10) {
+			$stats{progs_with_invalid_end}++;
+			printf "WARNING: programme with event_id '$event_id' had an invalid end time of '$event_end'; skipped\n";
+			next;
+		}
+
+		my $channel = $item->{'co_v_short'};
+
+		if (ref($channel) eq "ARRAY") { # paytv channels
+
+			$channel = $channel->[0]->{0};
+			$channel =~ s/(\s|\[|\]|\+|\&)//g; 
+			$channel = $paytv_fixups{$channel} if (defined $paytv_fixups{$channel});
+
+			# Yahoo7 guide is broken in non daylight savings states (QLD at least) returning FTA
+			# without DLS and Foxtel with DLS. Only apply offset if switch is set and in opt_channels
+			if (defined $opt_channels->{$channel}) {
+			    $event_start -= $time_offset if (defined $opt->{paytvoffset});
+			    $event_end -= $time_offset if (defined $opt->{paytvoffset});
+			}
+                }
+
+		# Hack; assuming this is a temporary typo
+		$channel = 'ABC News 24' if ($channel eq 'ABCNews24');
+		$channel = 'WIN GEM' if ($channel eq 'WINGEM');
+		$channel = '31 Digital' if ($channel eq '31Digital'); 
+		$channel = 'ABC2 / KIDS' if ($channel eq 'ABC2/KIDS');
+		$channel = 'SBS 2' if ($channel eq 'SBS2');
+		$channel = 'Food Network' if ($channel eq 'FoodNetwork');
+		$channel = 'TEN HD' if ($channel eq 'TENHD');
+
+# Temp hack Oct 2010 when Seven-related channels gave bad data
+#		if (grep ($channel eq $_, ('Seven', 'Prime', '7mate', '7TWO', 'Prime HD', 'Seven HD')))
+#		{
+#		        &Shepherd::Common::log("ignoring unreliable channel '$channel'");
+#			$d->{ignored_channels}->{$channel} = 1;
+#			$stats{skipped_channels}++;
+#			next;
+#		}
+
+		if ((!defined $channels->{$channel}) && (!defined $opt_channels->{$channel})) {
+			if (!defined $d->{ignored_channels}->{$channel}) {
+				$d->{ignored_channels}->{$channel} = 1;
+				$stats{skipped_channels}++;
+				Shepherd::Common::log("ignoring unwanted channel '$channel'");
+			}
+			next;
+		}
+
+
+		$event_id = $event_start.":".$event_end.":".$event_id; # event_id actually isn't unique - so make it so
+
+		$stats{programmes}++;
+		$stats{duplicate_programmes}++ if ($tv_guide->{$channel}->{data}->{$event_id});
+
+		# store it in the correct XMLTV schema!
+		$tv_guide->{$channel}->{data}->{$event_id}->{'channel'} = $channels->{$channel} if (defined $channels->{$channel});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'channel'} = $opt_channels->{$channel} if (defined $opt_channels->{$channel});
+
+		$tv_guide->{$channel}->{data}->{$event_id}->{'start'} = POSIX::strftime("%Y%m%d%H%M", localtime($event_start));
+		$tv_guide->{$channel}->{data}->{$event_id}->{'stop'} = 	POSIX::strftime("%Y%m%d%H%M", localtime($event_end));
+
+		# Hack for what seems to be a bug in the datasource:
+		# i.e. titles/sub-titles of "Law &Order" rather than "Law & Order".
+		$item->{title}->[0]->{0} =~ s/ \&(?=\S)/ \& /g if (defined $item->{title});
+		$item->{subtitle}->[0]->{0} =~ s/ \&(?=\S)/ \& /g if (defined $item->{subtitle});
+
+		$tv_guide->{$channel}->{data}->{$event_id}->{'title'} = 	[[ $item->{title}->[0]->{0}, $opt->{lang} ]] if (defined $item->{title});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'desc'} = 		[[ $item->{description_1}, $opt->{lang} ]] if (defined $item->{description_1});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'sub-title'} = 	[[ $item->{subtitle}->[0]->{0}, $opt->{lang} ]] if (defined $item->{subtitle});
+
+		my %genre, my $category, my $category2;
+		$genre{movie} = 1 if ((defined $item->{show_type}) && ($item->{show_type} eq "Movie"));
+		$genre{live} = 1 if (defined $item->{live});
+		$category = $item->{genre} if (defined $item->{genre});
+		if ((defined $item->{'category'}) && (defined $item->{'category'}->[0]->{'item'}->[0]->{0})) {
+			my $category2 = $item->{'category'}->[0]->{'item'}->[0]->{0};
+			$category = $category2 if (!defined $category);
+			$genre{$category2} = 1;
+		}
+		$tv_guide->{$channel}->{data}->{$event_id}->{'category'} = 	[ &Shepherd::Common::generate_category($item->{title}->[0]->{0}, $category, %genre) ];
+		Shepherd::Common::log(sprintf "category: chose '%s' from '%s' and '%s' for '%s'",
+			$tv_guide->{$channel}->{data}->{$event_id}->{'category'}->[0]->[0], $category,
+			join(', ',keys %genre), $item->{title}->[0]->{0}) if (defined $opt->{debug});
+
+		$tv_guide->{$channel}->{data}->{$event_id}->{'country'} = 	[ map([$_,$opt->{lang}], split(/\//, $item->{country})) ] if (defined $item->{country});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'premiere'} = 	[ 'premiere', $opt->{lang} ] if (defined $item->{'premiere'});
+
+		my $rating = "";
+		$rating .= $item->{rating} if (defined $item->{'rating'});
+		$rating .= " ".lc($item->{warnings}) if (defined $item->{'warnings'});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'rating'} =	[[ $rating, 'ABA', undef ]] if $rating ne "";
+
+		$tv_guide->{$channel}->{data}->{$event_id}->{'credits'}{'actor'} = [ split(/, /, $item->{main_cast}) ] if (defined $item->{main_cast});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'credits'}{'director'} = [ split(/, /, $item->{director}) ] if (defined $item->{director});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'credits'}{'writer'} = [ split(/, /, $item->{writer}) ] if (defined $item->{writer}); # unseen
+		$tv_guide->{$channel}->{data}->{$event_id}->{'date'} = 	$item->{year_released} if (defined $item->{year_released});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'previously-shown'} = { } if (defined $item->{repeat});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'subtitles'} = 	[ { 'type' => 'teletext' } ] if (defined $item->{captions});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'last-chance'} = 	[ 'final', $opt->{lang} ] if (defined $item->{final});
+
+		my %video_details;
+		if ((defined $item->{colour}) && ($item->{colour} == 1)) {
+			$video_details{'colour'} = 1;
+			$tv_guide->{$channel}->{data}->{$event_id}->{'video'} = \%video_details;
+		}
+
+		$tv_guide->{$channel}->{data}->{$event_id}->{'length'} = ($item->{running_time} * 60) if (defined $item->{running_time});
+		$tv_guide->{$channel}->{data}->{$event_id}->{'language'} = [ $item->{language}, $opt->{lang} ] if (defined $item->{language});
+
+		$d->{seen_progs}->{$channel}++;
+
+		# print out any unused fields
+		foreach my $field (keys %{($item)}) {
+			next if ($field =~ /(event_id|co_v_short|event_date|end_date|title|subtitle|description_1|show_type|category|country|premiere|rating|warnings|main_cast|director|writer|year_released|repeat|captions|final|colour|running_time|language|genre|live)/); # parsed fields
+			next if ($field =~ /(program_id|series_id|genre_id|venue_id|y7_url|highlight)/); # ignored fields
+			next if (defined $d->{ignored_field}->{$field});
+			$d->{ignored_field}->{$field} = 1;
+			Shepherd::Common::log("ignoring unknown field '$field'");
+		}
+	}
+}
+
+######################################################################################################
+
+sub write_data
+{
+	my %writer_args = ( encoding => 'ISO-8859-1' );
+	if ($opt->{outputfile}) {
+		my $fh = new IO::File(">$opt->{outputfile}")  or die "can't open $opt->{outputfile}: $!";
+		$writer_args{OUTPUT} = $fh;
+	}
+
+	my $writer = new XMLTV::Writer(%writer_args);
+
+	$writer->start
+	  ( { 'source-info-name'   => "$progname $version",
+	      'generator-info-name' => "$progname $version"} );
+
+	for my $channel (sort keys %{$channels}) {
+		$writer->write_channel( {'display-name' => [[ $channel, $opt->{lang} ]], 'id' => $channels->{$channel}} )
+		  if (defined $d->{seen_progs}->{$channel});
+	}
+	for my $channel (sort keys %{$opt_channels}) {
+		$writer->write_channel( {'display-name' => [[ $channel, $opt->{lang} ]], 'id' => $opt_channels->{$channel}} )
+		  if (defined $d->{seen_progs}->{$channel});
+	}
+
+	my $abc2_eariest_start = "300000000000";
+
+	for my $channel (sort keys %{($d->{seen_progs})}) {
+		for my $event_id (sort {$a cmp $b} keys %{($tv_guide->{$channel}->{data})}) {
+			my $show = $tv_guide->{$channel}->{data}->{$event_id};
+			Shepherd::Common::cleanup($show);
+			$writer->write_programme($show);
+
+			$abc2_eariest_start = $show->{'start'}
+					if ($channel eq "ABC2" && $abc2_eariest_start > $show->{'start'});
+		}
+	}
+
+	# check if abc2 has a gap on the first day when the station is closed
+	if ($abc2_eariest_start != "300000000000" && (!defined $opt->{offset}) && defined $channels->{ABC2} &&
+			$abc2_eariest_start > POSIX::strftime("%Y%m%d%H%M", localtime($starttime))) {
+
+		# create 7am today
+		my @timeattr = localtime($script_start_time); # 0=sec,1=min,2=hour,3=day,4=month,5=year,6=wday,7=yday,8=isdst
+		$timeattr[0] = 0; # zero seconds
+		$timeattr[1] = 0; # min
+		$timeattr[2] = 7; # hours 7am
+		my $time7am = mktime(@timeattr);
+		$time7am -= $time_offset;
+		my $xmltime7am = POSIX::strftime("%Y%m%d%H%M", localtime($time7am));
+
+		if (($starttime < $time7am) && ($abc2_eariest_start == $xmltime7am))
+		{
+			my $show;
+			$show->{'channel'} =    $channels->{ABC2};
+			$show->{'title'} =      [[ "Station Close Guess", $opt->{lang} ]];
+			$show->{'start'} =      POSIX::strftime("%Y%m%d%H%M", localtime($starttime));
+			$show->{'stop'} =       $abc2_eariest_start;
+
+			Shepherd::Common::cleanup($show);
+			$writer->write_programme($show);
+		}
+	}
+
+	$writer->end();
+}
+
+######################################################################################################
+
+sub check_for_paytv
+{
+	$d->{want_paytv} = 0;
+	foreach my $ch ( 
+	    qw(
+	    111Hits 111HITS2 13THSTREET 13thSTREET2 3DChannel ACC AdultsOnly960 AIR AnimalPlanet AntennaGreek AntennaPacific 
+	    APAC Arena Arena2 Aurora BBCKnowledge BBCKnowledgeHD BBCWorldNews Bio BloombergTelevision Boomerang CartoonNetwork 
+	    Cbeebies ChannelV CMC CNBC CNN Comedy2 ComedyChannel Crime Discovery2 DiscoveryChannel DiscoveryHD DiscoveryHealth 
+	    DiscoveryRealTime DiscoveryScience DiscoveryTravel DiscoveryTurboMAX DiscoveryWorldHD DiscTurboMAX2 DisneyChannel 
+	    E!Entertainment ERTGreek ESPN ESPNHD Eurosport Eurosportnews EXPO FashionTV FMC FOX8 FOX82 FOX8HD FOXClassics 
+	    FOXClassics2 FOXNews FOXSPORTS1 FoxSports1HD FOXSPORTS2 FoxSports2HD FOXSPORTS3 FoxSports3HD FOXSPORTSNews 
+	    FoxtelBoxOffice FUELTV Hallmark HOWTOChannel KidsCo LifeStyle2 LifeStyleFOOD LifestyleFOOD2 LifeStyleYOU LifStyleYOU2
+	    MAX MOVIEEXTRA MOVIEGREATS MOVIEONE MOVIEONEHD MOVIETWO MTV MTVClassic MTVHits MTVNLive MTVNLiveHD NatGeo2
+	    NatGeoAdventure NatGeoAdventure2 NatGeoHD NATGEOWILD NatGeoWild NatGeoWildHD NationalGeographic Nickelodeon
+	    NickJr Ovation PlayhouseDisney RAIITALIA SCIFI SCIFI2 showcase showcaseHD showcasetwo ShowPremiereHD
+	    showtimeaction showtimeactionHD showtimecomedy showtimedrama showtimepremiere showtimetwo SkyNewsAustralia SkyNewsBusiness
+	    SKYNewsBusiness SKYNewsNational SkyRacing SKYRacing SKYRacing2 SKYRacingWorld SPEED SPEEDHD STARPICS1 STARPICS1HD STARPICS2
+	    STARPICS2HD STVDIO TCM TheHistoryChannel TheLifeStyleChannel TheStyleNetwork TheWeatherChannel TLC TLC2 TSN TV1 TV12
+	    TVE TVN UKTV UKTV2 UKTVHD Universal VHits W W2 WHD WORLDMOVIES
+	    )
+	) {
+	    $d->{want_paytv}++ if ((exists $channels->{$ch} || exists $opt_channels->{$ch}));
+	}
+
+	$d->{want_paytv}++ if (defined $opt->{paytv});
+	if ($d->{want_paytv} > 0) {
+	    Shepherd::Common::log("going to gather paytv channels as we have ".$d->{want_paytv}." paytv channels matching.");
+	    Shepherd::Common::log("offsetting paytv channels by ".($time_offset/60)." minutes due to --paytvoffset") if (defined $opt->{paytvoffset});
+		$d->{fetch_interval} = (3 * 3600);	# 3 hours (for now)
+	} else {
+		$d->{fetch_interval} = (6 * 3600);	# 6 hours
+	}
+}

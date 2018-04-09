@@ -1,0 +1,591 @@
+#!/usr/bin/env perl
+#
+# sbsweb TV guide grabber
+#
+# Good data, usually 14-21 days, but has a lot of variability
+# in titles & subtitles.
+#
+# Currently only good for SBS, SBS TWO and NITV, not SBS News, but
+# has been coded to make adding any future channels easy.
+#
+# to test this file run like this:
+# perl -I /var/lib/mythtv/.shepherd/references/ ~mythtv/.shepherd/grabbers/sbsweb/sbsweb  --channels_file /var/lib/mythtv/.shepherd/channels.conf
+
+my $version = '5.04';
+
+use strict;
+use warnings;
+use Getopt::Long;
+use POSIX;
+use Data::Dumper;
+use IO::File;
+use XMLTV;
+use Shepherd::Common;
+use Encode;
+use JSON;
+use HTML::Entities;
+
+# ---------------------------------------------------------------------------
+# --- Global Variables
+
+my $progname = "sbsweb";
+
+my $DATASOURCE = "sbs.com.au";
+my $URL = "http://$DATASOURCE/guide";
+my $lang = 'en';
+my $debug = 0;
+my $channels;
+my $opt_channels;
+my $opt = { };
+my %stats;
+my $shows;
+my $runtime = time;
+my $zerohr;
+my $loc;
+
+# ---------------------------------------------------------------------------
+# --- Setup
+
+print "$progname $version\n";
+
+$| = 1;
+
+&get_command_line_options;
+
+exit 0 if ($opt->{version});
+
+&help if ($opt->{help});
+
+&set_defaults;
+
+&read_channels_file;
+
+unless ($channels)
+{
+    print "ERROR: No channels requested. Please use --channels_file.\n";
+    exit 33;
+}
+
+&set_region;
+
+&get_guide_data($_);
+
+&tidy_data;
+
+# print Dumper($shows) if ($debug);
+
+&write_xml;
+
+&Shepherd::Common::print_stats($progname, $version, $runtime, %stats);
+
+&log("Done.");
+exit;
+
+
+# ---------------------------------------------------------------------------
+# --- Subs
+
+sub get_guide_data
+{
+    &log("Grabbing data for days " . $opt->{offset} .
+         " - " . ($opt->{days} - 1) .
+	 ($opt->{output} ? " into " . $opt->{output} : ''));
+
+    &log("Channels wanted: " . join (", ", keys %{$channels}) . ".");
+
+    if ($opt->{offset} > 0)
+    {
+	$opt->{offset}--;
+	&log("Fetching previous day to get pre-5AM data.\n");
+    }
+
+    for my $day ($opt->{offset} .. $opt->{days} - 1)
+    { 
+	my $daystr = &POSIX::strftime("%Y-%m-%d", localtime($runtime + ($day * 86400)));
+	&log("Day $day: $daystr ($loc)");
+
+	my $url = "$URL/day/$daystr/location/$loc";
+	my $guidedata = &Shepherd::Common::get_url($url);
+	exit 11 unless ($guidedata);
+
+	Encode::from_to($guidedata, "UTF-8", "iso-8859-1");
+
+	&parse_guide($guidedata, $day, $daystr);
+    }
+    &log("Found " . &num_items($shows) . " shows on " . scalar(keys %$shows) . " channels.");
+}
+
+sub parse_guide
+{
+    my ($guidedata, $day, $daystr) = @_;
+
+    &log("Parsing guide page (Day $day).") if ($debug);
+
+    my $decoded_json;
+    foreach my $line (split /^/, $guidedata)
+    {
+	if ($line =~ /^\s*tv:(\s*\[\{.*),/)
+	{
+	    $line = '{ "tv": ' . $1 . '}';
+	    $decoded_json = &JSON::decode_json($line);
+	    last;
+	}
+    }
+    unless ($decoded_json)
+    {
+	&log("ERROR: Unable to parse $daystr (Day $day)!");
+	exit 11;
+    }
+
+    my @channels = @{$decoded_json->{'tv'}};
+    foreach my $chan (@channels)
+    {
+	my $channel_name = $chan->{name};
+	my $chanid = $channels->{$channel_name};
+	unless ($chanid)
+	{
+	    &log("Ignoring channel $channel_name: not requested by user.") if ($opt->{debug});
+	    next;
+	}
+	&log("Channel: $channel_name");
+	foreach my $listing (@{$chan->{programs}})
+	{
+	    $stats{'shows'}++;
+
+	    my $show = { };
+	    $show->{title} = &HTML::Entities::decode($listing->{programTitle});
+	    &log("- " . $show->{title}) if ($opt->{debug});
+
+
+	    $show->{start} = $listing->{playtime};
+	    $show->{channel} = $chanid;
+	    $show->{stop} = $listing->{endtime};
+	    $show->{length} = $listing->{duration} * 60;
+	    $show->{desc} = $listing->{longSynopsis} || $listing->{shortSynopsis};
+	    &Shepherd::Common::cleanup(\$show->{desc}) if $show->{desc};
+	    $show->{desc} = &HTML::Entities::decode($show->{desc});
+
+	    push (@{$show->{category}}, 'News') if ($show->{title} =~ /News/);
+	    $show->{'previously-shown'} = { } if ($listing->{isRepeat});
+
+	    push @{$show->{'subtitles'}}, 'teletext' if ($listing->{closedCaption});
+
+	    $show->{video}->{aspect} = '16:9' if ($show->{desc} =~ / WS /);
+
+	    if ($listing->{'rating'} and $listing->{'rating'} ne 'NC')
+	    {
+		$show->{'rating'} = [ [ $listing->{'rating'}, 'ABA', undef] ];
+	    }
+
+	    if ($show->{desc} =~ /Directed by (.*?)(?: and| \(|[,\.])/)
+	    {
+		$show->{credits}{director} = [ $1 ];
+	    }
+	    if ($show->{desc} =~ / [sS]tar(?:s|ring) (.*?),? and (.*?)\./)
+	    {
+		$show->{credits}{actor} = [ split(/, /, $1), $2 ];
+	    }
+	    $show->{country} = $listing->{countryOfOrigin} if ($listing->{countryOfOrigin});
+	    $show->{language} = $listing->{language} if ($listing->{language});
+
+	    $show->{'category'} = [ &Shepherd::Common::generate_category($show->{'title'}, $listing->{genre}, { }) ];
+	    $show->{'episode-num'} = [[ $listing->{episodeNo}, 'onscreen' ]] if ($listing->{episodeNo});
+
+	    $shows->{$chanid}->{$show->{start}} = $show;
+	}
+    }
+}
+
+# 1. Calculate stop times
+# 2. Fix errors in title
+# 3. Figure out likely subtitles
+sub tidy_data
+{
+    &log("Tidying data.") if ($debug);
+    foreach my $ch (keys %$shows)
+    {
+	my $last_start_time;
+	foreach my $s (reverse sort keys %{$shows->{$ch}})
+	{
+	    # 1. Calculate stop times
+	    
+	    $shows->{$ch}->{$s}->{stop} = $last_start_time if ($last_start_time);
+	    $last_start_time = $shows->{$ch}->{$s}->{start};
+
+	    # 2. Guess subtitles.
+
+            # Movies don't have subtitles
+            unless (grep ($_ eq 'movie', @{$shows->{$ch}->{$s}->{category}}))
+	    {
+		if ($shows->{$ch}->{$s}->{title} =~ /(.*) (Ep \d+)/i)
+		{
+		    &log("Splitting title for Ep (" .
+			$shows->{$ch}->{$s}->{title} .
+			")") if ($debug);
+
+		    $shows->{$ch}->{$s}->{title} = $1;
+		    $shows->{$ch}->{$s}->{'sub-title'} = $2;
+		}
+		if ($shows->{$ch}->{$s}->{title} =~ /(.*) (?:Series|[12]\d\d\d) \d+/i)
+		{
+		    &log("Stripping series from title (" .
+			 $shows->{$ch}->{$s}->{title} .
+			 ")") if ($debug);
+		    $shows->{$ch}->{$s}->{title} = $1;
+		}
+		if ($shows->{$ch}->{$s}->{title} =~ /(.*) [12]\d\d\d$/i)
+		{
+		    my $title = $1;
+		    if ($title =~ / News/)
+		    {
+			&log("Stripping year from title (" .
+			    $shows->{$ch}->{$s}->{title} .
+			    ")") if ($debug);
+			$shows->{$ch}->{$s}->{title} = $title;
+		    }
+		}
+		if ($shows->{$ch}->{$s}->{title} =~ /(.*) - New Series/i)
+		{
+		    &log("Stripping annotation from title (" .
+			 $shows-{$ch}->{$s}->{title} .
+			 ")") if ($debug);
+		    $shows->{$ch}->{$s}->{title} = $1;
+		}
+		unless (($shows->{$ch}->{$s}->{'sub-title'}))
+		{
+		    if ($shows->{$ch}->{$s}->{title} =~ /(.*)(?::| -) (.*)/
+			    and
+			length($1) > 5)
+		    {
+			&log("Splitting title (" .
+			    $shows->{$ch}->{$s}->{title} .
+			    ")") if ($debug);
+			$shows->{$ch}->{$s}->{title} = $1;
+			$shows->{$ch}->{$s}->{'sub-title'} = $2;
+		    }
+		    elsif ($shows->{$ch}->{$s}->{desc} =~ /^(.*?) - (.*)/
+			    and
+			length($1) < 36
+			    and
+			grep(/^[A-Z]/, split(/ /, $2)))
+		    {
+			my ($subtitle, $rest) = ($1, $2);
+
+			# strip parentheses if they contain entire subtitle
+			$subtitle = $1 if ($subtitle =~ /^\((.*)\)$/);
+
+			&log("Splitting desc of " .
+			     $shows->{$ch}->{$s}->{title} .
+			     " (" .
+			     substr($shows->{$ch}->{$s}->{desc}, 0, 38) .
+			     "...)") if ($debug);
+
+			$shows->{$ch}->{$s}->{desc} = $rest;
+
+			# Drop subtitle if it's the same as the show name.
+			# Kinda unfortunate in that occasionally this will
+			# lead to incorrect dropping, but otherwise we get
+			# lots of bad subtitles.
+			unless ($shows->{$ch}->{$s}->{title} =~ /^\Q$subtitle\E$/i)
+			{
+			    if ($subtitle =~ /^movie\b/i)
+			    {
+				push @{$shows->{$ch}->{$s}->{category}}, 'movie';
+			    }
+			    else
+			    {
+				$shows->{$ch}->{$s}->{'sub-title'} = $subtitle;
+			    }
+			}
+		    }
+		    # Set "Part x of y" as subtitle if nothing better
+		    elsif ($shows->{$ch}->{$s}->{desc} =~ /\((part \d+(?: of \d+))\)/i)
+		    {
+			$shows->{$ch}->{$s}->{'sub-title'} = $1;
+		    }
+                }
+	    }
+
+            # 3. Fix title errors
+
+	    if ($shows->{$ch}->{$s}->{title} =~ /(.*) \(([A-Z]{1,2})\)$/)
+	    {
+		&log("Dropping rating from title (" .
+		    $shows->{$ch}->{$s}->{title} .
+		    ")") if ($debug);
+		$shows->{$ch}->{$s}->{title} = $1;
+	    }
+
+            if ($shows->{$ch}->{$s}->{title} =~ /(.*), (the|le|les|la|l')$/i)
+            {
+                &log("Correcting title (" .
+                     $shows->{$ch}->{$s}->{title} .
+                     ")") if ($debug);
+                $shows->{$ch}->{$s}->{title} = "$2 $1";
+            }
+            if ($shows->{$ch}->{$s}->{title} =~ /(.*) +\(?\*.*\*\)?/)
+            {
+                &log("Stripping title \"" .
+                     $shows->{$ch}->{$s}->{title} .
+                     '"') if ($debug);
+                $shows->{$ch}->{$s}->{title} = $1;
+            }
+
+	    # 4. Title & sub-title whitespace tidy
+	    $shows->{$ch}->{$s}->{title} = strip_whitespace($shows->{$ch}->{$s}->{title});
+	    if ($shows->{$ch}->{$s}->{'sub-title'})
+	    {
+		$shows->{$ch}->{$s}->{'sub-title'} = strip_whitespace($shows->{$ch}->{$s}->{'sub-title'});
+	    }
+	}
+    }
+}
+
+sub write_xml
+{
+    my %writer_args = ( encoding => 'ISO-8859-1' );
+
+    &log("Writing " . &num_items($shows) . " shows to XML.");
+
+    if ($opt->{output})
+    {
+	my $fh = new IO::File(">" . $opt->{output})
+	    or die "Can't open " . $opt->{output} . ": $!";
+	$writer_args{OUTPUT} = $fh;
+    }
+
+    my $writer = new XMLTV::Writer(%writer_args);
+
+    $writer->start
+	( { 'source-info-url'    => $DATASOURCE,
+	    'source-info-name'   => $progname,
+	    'generator-info-name' => "$progname $version"} );
+
+    for my $channel (sort keys %$channels)
+    {
+	$writer->write_channel( { 
+		'display-name' => [ [ $channel, $lang ] ],
+		'id' => $channels->{$channel} } );
+    }
+
+    foreach my $ch (sort keys %$shows)
+    {
+	foreach my $s (sort keys %{$shows->{$ch}})
+	{
+	    # Don't return shows with no stop time
+	    unless ($shows->{$ch}->{$s}->{stop})
+	    {
+		&log("-- No stop time: dropping " . 
+		     $shows->{$ch}->{$s}->{title}) if ($debug);
+		next;
+	    }
+
+	    # Format for XMLTV-compliance
+	    my %p = %{$shows->{$ch}->{$s}};
+	    foreach my $field ('title', 'sub-title', 'desc', 'country')
+	    {
+		$p{$field} = [[ $p{$field}, $lang ]] if ($p{$field});
+	    }
+	    $p{language} = [ $p{language}, $lang ] if ($p{language});
+	    $p{start} = &POSIX::strftime("%Y%m%d%H%M", localtime($p{start}));
+	    $p{stop} = &POSIX::strftime("%Y%m%d%H%M", localtime($p{stop}));
+	    $p{rating} = [[ $p{rating}, 'ABA', undef ]] if ($p{rating});
+	    if ($p{category} && ref($p{category}) eq "ARRAY"
+		    && $p{category}[0] && ref($p{category}[0]) ne "ARRAY") # obsolete 14/10/2007
+	    {
+		foreach (@{$p{category}})
+		{
+		    $_ = [ &Shepherd::Common::translate_category($_), $lang ];
+		}
+	    }
+	    if ($p{subtitles})
+	    {
+		my @s;
+		foreach (@{$p{subtitles}})
+		{
+		    push @s, { type => $_ };
+		}
+		$p{subtitles} = [ @s ];
+	    }
+	    $p{desc} = [ ] unless ($p{desc});
+	    delete $p{pid};
+	    delete $p{details};
+
+	    if ($debug)
+	    {
+		&log("-> " . $shows->{$ch}->{$s}->{title} .
+		     ($shows->{$ch}->{$s}->{'sub-title'} ?
+		      ' ("' . $shows->{$ch}->{$s}->{'sub-title'} . '")' : ''));
+	    }
+	    $shows->{$ch}->{$s}->{start} = &POSIX::strftime("%Y%m%d%H%M", localtime($s));
+            if(length($shows->{$ch}->{$s}->{title})) {
+               $writer->write_programme(\%p);
+            }else{
+                &log( "ignoring bad title data for program with start time" . $shows->{$ch}->{$s}->{start} ."\n");
+            }
+	    
+	}
+    }
+
+    $writer->end();
+}
+
+# ---------------------------------------------------------------------
+# Helper subs
+
+sub num_items
+{
+    my $hash = shift;
+    my $count = 0;
+    foreach my $ch (keys %$hash)
+    {
+	$count += scalar keys %{$hash->{$ch}};
+    }
+    return $count;
+}
+
+sub strip_whitespace 
+{
+    $_[0] =~ /^\s*(.*?)\s*$/ ? $1 : $_[0];
+}
+
+# ---------------------------------------------------------------------
+# Setup subs
+
+sub set_region
+{
+    # By coincidence, SBS uses the exact same state names that we do.
+    $loc = Shepherd::Common::which_state($opt->{region});
+
+    unless ($loc)
+    {
+	&log("Error: No valid location? Using default/national times.");
+	$loc = '';
+    }
+
+    &log("Location: $loc") if ($debug);
+}
+
+
+sub get_command_line_options
+{
+    &Getopt::Long::Configure('pass_through');
+    &GetOptions($opt, qw(
+			    help
+			    debug
+			    output=s
+			    do-extra-days
+			    days=i
+			    offset=i
+			    region=i
+			    channels_file=s
+			    version
+			));
+    $debug = $opt->{debug};
+
+    if (@ARGV)
+    {
+	&log("\nUnknown option(s): @ARGV\n");
+    }
+}
+
+sub set_defaults
+{
+    my $defaults = {
+	'days' => 7,
+	'offset' => 0,
+	'region' => 94,
+	'output' => &getcwd . '/output.xmltv',
+	'channels_file' => &getcwd . '/channels.conf'
+    };
+
+    if (defined $opt->{'do-extra-days'}) {
+    $opt->{'days'} = 21;
+    }
+
+    foreach (keys %$defaults)
+    {
+	unless (defined $opt->{$_})
+	{
+	    $opt->{$_} = $defaults->{$_};
+	}
+    }
+
+    $opt->{'days'} = 31 if ($opt->{'days'} > 31);
+
+    &Shepherd::Common::set_defaults(
+	stats => \%stats,
+	delay => "1-5",
+	debug => $debug,
+	webwarper => $opt->{warper}
+	);
+
+    # Initialize stats
+    %stats = ( );
+    foreach (qw( shows ))
+    {
+	$stats{$_} = 0;
+    }
+}
+
+sub read_channels_file 
+{
+    &read_config_file('channels', 'channels_file');
+    unless ($channels)
+    {
+	print "ERROR: No channels requested. Please use --channels_file.\n";
+	exit 33;
+    }
+    unless (keys %$channels)
+    {
+	&log("ERROR: No supported channels requested. Exiting.");
+	exit 22;
+    }
+
+}
+
+sub read_config_file
+{
+    my ($name, $arg) = @_;
+
+    return unless ($opt->{$arg});
+    &log("Reading $name file: $opt->{$arg}");
+    if (-r $opt->{$arg})
+    {
+	local (@ARGV, $/) = ($opt->{$arg});
+	no warnings 'all';
+	eval <>;
+	die "Can't parse $name file: $@" if ($@);
+    }
+    else
+    {
+	&log("Unable to read $name file.");
+    }
+}
+
+sub log
+{
+    &Shepherd::Common::log(@_);
+}
+
+sub help
+{
+    print q{
+Command-line options:
+  --help                 Print this message
+  --version              Show current version
+
+  --output <file>        Write XML into the specified file
+  --channels_file <file> Read channel subscriptions from file
+
+  --region <n>           Grab data for region code <n>
+  --days <n>             Grab <n> days of data (today being day 1)
+  --do-extra-days        Grab up to 21 days of data
+
+  --offset <n>           Skip the first <n> days
+
+  --debug                Print lots of debugging output
+};
+    exit 0;
+}
+

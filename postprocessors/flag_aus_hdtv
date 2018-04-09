@@ -1,0 +1,834 @@
+#!/usr/bin/env perl
+
+# flag_aus_hdtv
+
+# performs two functions:
+#   1. takes existing programmes flagged as HDTV by grabbers,
+#   2. checks the DTV Forum Australia (http://www.dtvforum.info/)
+#  .. and populates the '(chan)HD' channels (if they exist)
+#  with the HD versions of the programs.
+
+#  originally written by Richard Dale <richard@interlink.com.au>,
+#  September 2006
+#  Modified to use DTV Forums Australia instead of Digital Broadcasting Australia
+#  http://www.dtvforum.info/index.php?showtopic=28574
+#  Chris Williams <shepherd@psychogeeks.com>
+#  May 2008
+
+my $progname = "flag_aus_hdtv";
+my $version = "0.51";
+
+$| = 1;
+print "$progname v$version\n";
+
+use strict;
+use Getopt::Long;
+use Shepherd::Common;
+use HTML::TreeBuilder;
+use IO::File;
+use XMLTV;
+use Data::Dumper;
+
+#
+# customizations
+#
+
+# Add overrides for HD - sometimes DBA doesn't always have the latest HD information about TV shows so set them here in the override
+my $hdoverride;
+# $hdoverride->{TEN} = [
+# 	"The Handler",
+# 	"N.Y.P.D. Blue",
+# 	"The Office",
+# 	"Battlestar Galactica"
+# 	];
+$hdoverride->{Nine} = [
+	"CSI: Crime Scene Investigation",
+	"Without a Trace"
+	];
+
+# Add translations for show names that differ between DBA and our normal tv_grab_au names
+my $translation;
+$translation->{'ACA'} = 'A Current Affair';
+$translation->{'CSI'} = 'CSI: Crime Scene Investigation';
+$translation->{'CSI-Miami'} = 'CSI: Miami';
+
+# translations between website and what we know channels as
+my $chan_name_translations;
+$chan_name_translations->{"ABC"} = "ABC HD";
+$chan_name_translations->{"Seven"} = "7HD";
+$chan_name_translations->{"Prime"} = "Prime HD";
+$chan_name_translations->{"Nine"} = "Nine HD";
+$chan_name_translations->{"One Digital"} = "One HD";
+$chan_name_translations->{"SBS"} = "SBS HD";
+
+my $hd_to_sds;
+@{$hd_to_sds->{"ABC HD"}} = ("ABC1");
+@{$hd_to_sds->{"7HD"}} = ("Seven","Southern Cross","SCTV Central","Central GTS/BKN","Golden West");
+@{$hd_to_sds->{"Prime HD"}} = ("Prime");
+@{$hd_to_sds->{"Nine HD"}} = ("Nine","WIN","NBN","Imparja");
+@{$hd_to_sds->{"One HD"}} = ("One Digital");
+@{$hd_to_sds->{"SBS HD"}} = ("SBS ONE");
+
+
+my $sd_to_hd;
+foreach my $hdchannel (keys %$hd_to_sds) {
+	foreach my $channel (@{$hd_to_sds->{$hdchannel}}) {
+		$sd_to_hd->{$channel} = $hdchannel;
+	}
+}
+
+#
+# options
+#
+
+my $script_start_time = time;
+my %stats;
+my $channels, my $reverse_channels, my $detailed_reverse_channels, my $opt_channels, my %channel_xmlid_to_opt_channel_xmlid, my $hdwithsd;
+my $d, my $ar, my $sd, my $hd;
+my $gapchannel, my $gaplaststop;
+my $override_settings = { };
+my %amp = ( nbsp => ' ', qw{ amp & lt < gt > apos ' quot " } );
+
+my $opt;
+$opt->{url} = "http://www.dtvforum.info/index.php?showtopic=28574";
+$opt->{newurl} = "http://www.dtvforum.info/index.php?showtopic=68946";
+
+$opt->{output_file} = "output.xmltv";
+$opt->{region} = 94;
+$opt->{debug} = 0;
+$opt->{action} = "copysd";
+
+&parse_command_line;
+
+# set defaults
+Shepherd::Common::set_default("debug", (($opt->{debug} > 0) ? 2 : 0));
+Shepherd::Common::set_default("stats" => \%stats);
+Shepherd::Common::set_default("retry_delay" => "15-45");
+
+# check XMLTV version for HDTV compatability
+my @xmltv_version = split(/\./,$XMLTV::VERSION);
+if (($xmltv_version[0] <= 0) && ($xmltv_version[1] <= "5") && ($xmltv_version[2] <= "43")) {
+	print " - XMLTV version ".$XMLTV::VERSION." too old to support HDTV flags. Disabling HDTV flags.\n";
+	$opt->{notag} = 1;
+	$stats{disabled_hdtv_flag}++;
+}
+
+&read_config_file($progname.".config",0);
+&apply_setting_overrides;
+
+&read_config_file($opt->{channels_file},1);
+
+&setup_channels;
+
+&lookup_website($opt->{url}, 0) if (!defined $opt->{nodbalookup});
+&lookup_website($opt->{newurl}, 1) if (!defined $opt->{nodbalookup});
+
+#
+# now eat up the XMLTV inputs we were given!
+#
+
+my %writer_args = ( encoding => 'ISO-8859-1' );
+my $fh = new IO::File(">".$opt->{output_file}) || die "can't open $opt->{output_file} for writing: $!";
+$writer_args{OUTPUT} = $fh;
+
+my $writer = new XMLTV::Writer(%writer_args);
+$writer->start( {
+	'source-info-name' => "$progname $version",
+	'generator-info-name' => "$progname $version"} );
+
+foreach my $file (@ARGV) {
+	printf "Parsing: %s\n",($file eq "-" ? "(from-stdin, hit control-D to finish)" : $file);
+	XMLTV::parsefiles_callback(undef, undef, \&channel_cb,\&programme_cb, $file);
+}
+
+&write_hd();
+
+$writer->end();
+printf "Finished parsing, output in $opt->{output_file}\n";
+
+Shepherd::Common::print_stats($progname, $version, $script_start_time, %stats);
+exit(0);   
+
+######################################################################################################
+# read settings
+
+sub read_config_file
+{
+        my($file,$die_on_failure) = @_;
+        if (!(-r $file)) {
+                die "file $file could not be read.  aborting.\n" if $die_on_failure;
+                return;
+        }
+        local (@ARGV, $/) = ($file);
+        no warnings 'all'; eval <>; die "$@" if $@;
+}
+
+######################################################################################################
+
+sub parse_command_line
+{
+	GetOptions(
+		'channels_file=s' => \$opt->{channels_file},
+		'config=s'	=> \$opt->{config_file},
+		'action=s'	=> \$opt->{action},
+		'region=i'	=> \$opt->{region},
+		'nodbalookup'	=> \$opt->{nodbalookup},
+		'url=s'		=> \$opt->{url},
+		'notag'		=> \$opt->{notag},
+		'days=i'	=> \$opt->{days},	# ignored
+		'offset=i'	=> \$opt->{offset},	# ignored
+		'output=s'	=> \$opt->{output_file},
+		'debug+'	=> \$opt->{debug},
+		'set=s'		=> \$opt->{set},
+		'help'		=> \$opt->{help},
+		'h'		=> \$opt->{help},
+		'v'		=> \$opt->{version},
+		'version'	=> \$opt->{version});
+
+	if ($opt->{help}) {
+		print<<EOF
+
+options:
+  --channels_file=(f)  shepherd channels file (mandatory)
+
+  --nodbalookup        don't look up programmes on DBA website (default: do)
+  --url=(url)          URL that lists HDTV programming (default: $opt->{url})
+
+  --action=(policy)    policy can be one of:
+                        move - move HD progs to HD channel (remove it from SD channel)
+                        copy - copy HD progs to HD channel (keep it in SD channel also)
+                        copysd - copy all progs to HD channel, flagging HD ones (default)
+  --notag              don't tag with HD flags (default: do)
+
+  --output=(f)         output XMLTV filename (default: $opt->{output})
+  --debug              increase debug level
+
+  --set=(setting):(value) save setting override: (value)
+        nodbalookup:1/0   (disable / enable) DBA website lookup
+	notag:1/0         (don't / do) tag with HD flags
+	action:move/copy/copysd  set policy (as per above)
+
+EOF
+;
+	}
+
+	exit 0 if (($opt->{version}) || ($opt->{help}));
+
+	if (defined $opt->{set}) {
+		&set_overrides;
+	}
+
+	die "'--channels_file {file}' must be specified. see --help for details.\n" if (!$opt->{channels_file});
+	if (($opt->{action} ne "move") && ($opt->{action} ne "copy") && ($opt->{action} ne "copysd")) {
+		print "unknown --action policy '$opt->{action}' using default 'copysd', see --help for details.\n\n";
+		$opt->{action} = "copysd";
+	}
+}
+
+######################################################################################################
+
+sub set_overrides
+{
+	&read_config_file($progname.".config",0);
+        my ($setting, $val) = split(/:/,$opt->{set});
+
+        die "--set format is (setting):(value)\n" if (!defined $val);
+
+	if (($setting eq "nodbalookup") || ($setting eq "notag")) {
+		die "--set value must be 1/0 for setting '$setting'.\n" if (($val ne "1") && ($val ne "0"));
+		$override_settings->{$setting} = $val;
+		printf "%s: override parameter %s: %s\n", $progname, $setting, ($val eq "0" ? "disabled" : "enabled");
+	} elsif ($setting eq "action") {
+		die "--set value must be copy/move for setting '$setting'.\n"
+				if (($val ne "move") && ($val ne "copy") && ($val ne "copysd"));
+		$override_settings->{$setting} = $val;
+		printf "%s: override parameter %s: %s\n", $progname, $setting, $val;
+	} else {
+		die "unknown '--set' parameter '$setting', see --help for details.\n";
+	}
+
+	&write_config;
+	exit(0);
+}
+
+######################################################################################################
+
+sub write_config
+{
+	open(F,">".$progname.".config") || die "can't write to config file $progname.config: $!\n";
+	print F Data::Dumper->Dump([$override_settings],["override_settings"]);
+	close F;
+}
+
+######################################################################################################
+
+sub apply_setting_overrides
+{
+	foreach my $setting (keys %$override_settings) {
+		if ($override_settings->{$setting} ne "0") {
+			printf "overriding setting %s: %s\n", $setting, $override_settings->{$setting};
+			$opt->{$setting} = $override_settings->{$setting};
+		}
+	}
+}
+
+######################################################################################################
+
+sub setup_channels
+{
+	while (my ($name, $chanid) = each %$channels) {
+		$detailed_reverse_channels->{$chanid} = $name;
+	}
+
+	# find the sd channel for each hd channel
+	foreach my $hdchannel (keys %$hd_to_sds) {
+		if (defined $channels->{$hdchannel}) {
+			foreach my $sdchannel (@{$hd_to_sds->{$hdchannel}}) {
+				if (defined $channels->{$sdchannel}) {
+					# there can be only one SD channel for the 7HD channel
+					$channel_xmlid_to_opt_channel_xmlid{$channels->{$sdchannel}} =
+							$channels->{$hdchannel};
+					$hd->{$channels->{$sdchannel}} = undef;
+					$hdwithsd->{$channels->{$hdchannel}} = 1;
+					print "  '$hdchannel' with xmlid '$channels->{$hdchannel}'" .
+							" populated with programs provided by " .
+							"'$sdchannel' with xmlid '$channels->{$sdchannel}'\n";
+					last;
+				}
+			}
+		}
+	}
+
+	# convert all channel names to network names
+	my $shortchannels;
+	while (my ($name, $chanid) = each %$channels)
+	{
+	    my $oldname = $name;
+
+		$name = @{$hd_to_sds->{$sd_to_hd->{$name}}}[0]
+				if (defined($sd_to_hd->{$name}));
+
+	    push @{$shortchannels->{$name}}, $chanid;
+	    print "  '$oldname' treated as '$name' with xmlid '$chanid'\n" if ($name ne $oldname);
+
+	    if (defined $opt_channels->{$oldname."HD"}) {
+		if (defined $channel_xmlid_to_opt_channel_xmlid{$chanid}) {
+		    print " - Skipping '${oldname}HD' treated as '${name}HD' with xmlid '" .
+			    $opt_channels->{$oldname."HD"} . "' " .
+			    "because channel already populated to channel '" .
+			    $detailed_reverse_channels->{$channel_xmlid_to_opt_channel_xmlid{$chanid}} .
+			    "' with xmlid '" .
+			    $channel_xmlid_to_opt_channel_xmlid{$chanid} .
+			    "', see previous messages.  Please reconfigure.\n";
+		} else {
+		    $channel_xmlid_to_opt_channel_xmlid{$chanid} = $opt_channels->{$oldname."HD"};
+		    print "  '${oldname}HD' treated as '${name}HD' with xmlid '" . $opt_channels->{$oldname."HD"} . "'\n"
+			    if ($name ne $oldname);
+		}
+	    }
+	}
+	$channels = $shortchannels;
+
+	foreach my $channel (keys %$channels) {
+		foreach my $chanid (@{$channels->{$channel}}) {
+			$reverse_channels->{$chanid} = $channel;
+		}
+	}
+}
+
+######################################################################################################
+
+sub lookup_website
+{
+	my $url = shift;
+	my $new = shift;
+
+	unlink "dba.html"; # old cache file before 2008-05-08
+
+	my $mirror_to = "dtvinfo.html";
+	$mirror_to = "dtvforum.html" if $new;
+	my $data = &Shepherd::Common::get_url(url => $url, mirror => $mirror_to);
+	# the website doesn't support 'If-Modified-Since' headers but we can live in hope
+	$data = &Shepherd::Common::get_mirror_file($mirror_to, 14) if (!$data);
+	return if (!$data);
+
+	my $prime_present = $data =~ /Prime\s+HD/; # hack Seven also to Prime if no Prime data
+
+	# Parse the HTML of the page
+	#
+	my $tree = HTML::TreeBuilder->new_from_content($data);
+	if (!$tree) {
+		print "Can't build tree from url.\n";
+		return;
+	}
+
+	# Find the first post in the thread
+	#
+	my $postNode = $tree->look_down('_tag'=>'div', 'class'=>'postcolor', 'id'=>qr{post-.*}); 
+	if ($postNode) {
+		# Found the post, let's iterate through the children extracting text.
+		#
+		# We're interested in the data that follows the second horizontal line of
+		# underscores and precedes the third line.  The earlier data is a
+		# comment, highlights list, and the later data is a disclaimer.
+		#
+		# The data is several chunks like this on the web page:
+		#
+		# Thursday 1st May 2008
+		# Nine HD
+		# 5:30am - Today
+		# 9:00am - Mornings With Kerri-Anne
+		# 11:30am - Fresh Cooking With The Australian Women's Weekly
+		# 7:00pm - Two And A Half Men (Did You Check with the Captain of the Flying Monkeys?)
+		# HD Only 11:00am - The Mountain [DD5.1]
+		# 
+		# but they may appear in this loop split onto several lines at <B>, <U> or
+		# other boundaries in the source markup.  For example, the last line becomes:
+		#
+		# HD Only
+		# 11:00am - The Mountain
+		# [DD5.1]
+		#
+		# because the "HD Only" is in a <SPAN> with colour red.  This splitting will
+		# not have a negative impact on the actual programme, channel, or date info, 
+		# as long as the triggering markup does not occur mid-field. It currently 
+		# doesn't.
+		#
+		my $datePattern = qr{(?:(\d?\d)(?:st|nd|rd|th)\s+([[:alpha:]]+)\s+(\d\d\d\d)$)|(?:[[:alpha:]]+\s+(\d?\d)/(\d?\d)/(\d\d)$)}io;
+		my $chanPattern = qr{^(ABC|Seven|Prime|Nine|Ten|SBS)\s+HD}io;
+		my $progPattern = qr{(\d?\d:\d\d\s*(?:am|pm))\s+(?:-\s+)?(.*)$}io;
+		my $currDate = undef;
+		my $currChan = undef;	
+
+		my $betweenLines = 0;	# Toggle as we parse each horiz. line
+		foreach my $node ($postNode->content_list()) {
+			my $text = (ref($node) eq 'HTML::Element') ?
+				$node->as_text() :
+				$node;
+			$text =~ s/^\s+|\s+$//g;	# strip leading/trailing spaces
+			next if $text eq '';		# skip empty strings
+			if ($text =~ m/^_+$/) {		# horiz line
+				$betweenLines++;
+				next;
+			}
+			next unless $betweenLines == 2 || $new;
+
+			if ($text =~ $datePattern) {
+				# Date is not currently used except for debugging
+				$currDate = "$1 $2 $3" if $1;	# e.g. 3 May 2008
+				$currDate = "$4/$5/$6" if $4;
+			}
+			elsif ($text =~ $chanPattern) {
+				my $channame = $1;
+				if (defined $chan_name_translations->{$channame}) {
+					$currChan = $chan_name_translations->{$channame};
+				} else {
+#					printf "** Found unknown channel '%s'! Ignored.\n", $channame;
+					$stats{unknown_channels}++;
+					$currChan = undef;
+				}
+			}
+			elsif ($text =~ $progPattern) {
+				# Time is not currently used except for debugging
+				my $progtime = $1;
+				my $progname = $2;
+				if (defined $currChan) {
+					# Clean up some cruft
+					$progname =~ s/\*$//;
+					$progname =~ s/^MOVIE:\s*//;
+					$progname =~ s/^HD Documentary:\s*/HD Docos: /;
+					$progname =~ s/\s*\([^(]+\)$//;	# (episode title)
+
+#					printf "Channel: '%s', Date: '%s', Time: '%s', Prog: '%s'\n",
+#						$currChan, $currDate, $progtime, $progname;
+
+					# Apply manual translation if needed
+					if (defined($translation->{$progname})) {
+						$progname = $translation->{$progname};
+						$stats{manual_translations}++;
+					}
+
+					# Store the result and update stats
+					push(@{$d->{prog}->{$currChan}}, $progname);
+					push(@{$d->{prog}->{'Prime HD'}}, $progname)
+						if ((!$prime_present) && ($currChan eq '7HD'));
+
+					$stats{parsed_hd_progs}++;
+				}
+				else {
+#					printf "** Ignoring matched prog '%s' at '%s'\n",
+#						$progname, $progtime;
+				}
+			}
+			else {
+#				printf "** Ignoring text '%s'\n", $text;
+			}
+		}
+	}
+	
+	# Clean up 
+	#
+	$tree->delete();
+}
+
+
+######################################################################################################
+
+sub channel_cb( $ )
+{
+	my $c = shift;
+	# printf "got channel ".Dumper($c);
+	$writer->write_channel($c);
+}
+
+######################################################################################################
+
+sub programme_cb( $ )
+{
+	my $prog=shift;
+	my $this_chan = $prog->{channel};
+	return if (!defined $this_chan);
+
+	# keep a copy of standard definition related to argumenting high definition channel programmes for program removal later
+	if (defined $channel_xmlid_to_opt_channel_xmlid{$this_chan} &&
+			defined $detailed_reverse_channels->{$channel_xmlid_to_opt_channel_xmlid{$this_chan}}) {
+		$sd->{$detailed_reverse_channels->{$channel_xmlid_to_opt_channel_xmlid{$this_chan}}}->
+				{Shepherd::Common::parse_xmltv_date($prog->{start})} = $prog;
+	}
+
+	my $this_title;
+	$this_title = $prog->{title}->[0]->[0]
+	  if (($prog->{title}) && ($prog->{title}->[0]) && ($prog->{title}->[0]->[0]));
+	# print "got programme ".Dumper($prog);
+	goto NOMATCH if (!defined $this_title);
+
+	# if programme is already marked as HDTV, just skip all of this
+	if ((defined $prog->{video}) && (defined $prog->{video}->{quality}) &&
+	    ($prog->{video}->{quality} =~ /hdtv/i)) {
+		printf "  matched '$this_title' (pre-marked)\n" if (!defined $d->{seenprog}->{$this_title});
+		$stats{prog_already_marked}++;
+		goto MATCH;
+	}
+
+	# see if title matches a known hd program for this channel
+	my $channel = $reverse_channels->{$this_chan};
+	$channel = $sd_to_hd->{$channel} if defined $sd_to_hd->{$channel}; # if sd name, use hd name
+	foreach my $t (@{$d->{prog}->{$channel}}) {
+		if (canonicalizeTitles_match($t,$this_title)) {
+			# match!
+			printf "  matched '$t' to '$this_title' (canonical match)\n" if (!defined $d->{seenprog}->{$this_title});
+			$stats{matched_prog}++;
+			goto MATCH;
+		}
+	}
+
+	# see if title matches something in our override table
+	foreach my $ch (keys %{($hdoverride)}) {
+		next if $ch ne $reverse_channels->{$this_chan};
+		foreach my $t (@{($hdoverride->{$ch})}) {
+			if (canonicalizeTitles_match($t,$this_title)) {
+				# match!
+				printf "  matched '$t' to '$this_title' (hd override)\n" if (!defined $d->{seenprog}->{$this_title});
+				$stats{override_matched_prog}++;
+				goto MATCH;
+			}
+		}
+	}
+
+NOMATCH:
+	# process later argumenting high definition channel programmes
+	if (defined $reverse_channels->{$this_chan} &&
+			defined $hd_to_sds->{$reverse_channels->{$this_chan}} &&
+			defined $hdwithsd->{$this_chan}) {
+		return if defined $this_title && $this_title eq "See main channel's listings for programming details";
+		# just because its on 7HD doesn't make it high definition
+		$ar->{$reverse_channels->{$this_chan}}->{Shepherd::Common::parse_xmltv_date($prog->{start})} = $prog;
+		return;
+	}
+
+	$writer->write_programme($prog);
+
+	# copy to high definition channel
+	if ($opt->{action} eq "copysd" && defined $channel_xmlid_to_opt_channel_xmlid{$this_chan}) {
+		$prog->{channel} = $channel_xmlid_to_opt_channel_xmlid{$this_chan};
+		# but don't write HD channel until all programs read
+		$hd->{$this_chan}->{Shepherd::Common::parse_xmltv_date($prog->{start})} = $prog;
+	}
+
+	return;
+
+MATCH:
+	$d->{seenprog}->{$this_title}++;
+	$prog->{video}->{aspect} = "16:9"; # widescreen
+
+	# process later argumenting high definition channel programmes
+	if (defined $reverse_channels->{$this_chan} &&
+			defined $hd_to_sds->{$reverse_channels->{$this_chan}} &&
+			defined $hdwithsd->{$this_chan}) {
+		return if defined $this_title && $this_title eq "See main channel's listings for programming details";
+		$prog->{video}->{quality} = "HDTV" unless (defined $opt->{notag});
+		$ar->{$reverse_channels->{$this_chan}}->{Shepherd::Common::parse_xmltv_date($prog->{start})} = $prog;
+		return;
+	}
+
+	if (!defined $channel_xmlid_to_opt_channel_xmlid{$this_chan}) {
+		# no HD variant
+		$prog->{video}->{quality} = "HDTV" unless (defined $opt->{notag});
+		$writer->write_programme($prog);
+		$stats{rewrote_prog_as_hdtv_inplace}++;
+	} else {
+		if ($opt->{action} eq "copy" || $opt->{action} eq "copysd") {
+			# SD channel
+			delete $prog->{video}->{quality};
+			$writer->write_programme($prog);
+			$stats{rewrote_prog_as_sdtv_inplace}++;
+		}
+
+		# populate this programme in HD channel
+		$prog->{video}->{quality} = "HDTV" unless (defined $opt->{notag});
+		$prog->{channel} = $channel_xmlid_to_opt_channel_xmlid{$this_chan};
+		# but don't write HD channel until all programs read
+		$hd->{$this_chan}->{Shepherd::Common::parse_xmltv_date($prog->{start})} = $prog;
+	}
+	return;
+}
+
+# $hd keys are orignal xmlids, with {channel} set to HD xmlids from $channel_xmlid_to_opt_channel_xmlid
+#	details from SD channels
+#		that can be found in $channel_xmlid_to_opt_channel_xmlid
+#		and are detected as HD or "copysd" is set
+# $sd keys are 7HD, Prime HD, Nine HD, TEN HD plus other $opt_channel *HD variants
+#	details from untouched SD channels
+#		that can be found in $channel_xmlid_to_opt_channel_xmlid
+# $ar keys are 7HD, Prime HD, Nine HD, TEN HD
+#	details from HD channels only: 7HD, Prime HD, Nine HD, TEN HD
+sub write_hd
+{
+	# remove from argument channel identical (time, title, sub-title) programs found on sd channel
+	foreach my $channel (keys %$ar) {
+		next if !defined $sd->{$channel};
+		foreach my $start (keys %{$ar->{$channel}}) {
+			if (defined $sd->{$channel}->{$start}) {
+				my $aprog = $ar->{$channel}->{$start};
+				my $prog = $sd->{$channel}->{$start};
+
+				if (Shepherd::Common::parse_xmltv_date($aprog->{stop}) ==
+						Shepherd::Common::parse_xmltv_date($prog->{stop}) &&
+						(!defined $aprog->{title} || !defined $prog->{title} ||
+							lc($aprog->{title}->[0]->[0]) eq lc($prog->{title}->[0]->[0])) &&
+						(!defined $aprog->{'sub-title'} || !defined $prog->{'sub-title'} ||
+							lc($aprog->{'sub-title'}->[0]->[0]) eq
+									lc($prog->{'sub-title'}->[0]->[0]))){
+					delete $ar->{$channel}->{$start};
+				}
+			}
+		}
+	}
+
+	# write high definition channel programs argumenting as needed
+	foreach my $xmlid (keys %$hd) {
+		my ($argument, @aprogs, $aprog);
+
+		# if an argument channel exists, sort the programs ready for inserting
+		if (defined $detailed_reverse_channels->{$xmlid} &&
+				defined $sd_to_hd->{$detailed_reverse_channels->{$xmlid}}) {
+			$argument = $sd_to_hd->{$detailed_reverse_channels->{$xmlid}};
+
+			print "  channel '";
+			if (defined $detailed_reverse_channels->{$channel_xmlid_to_opt_channel_xmlid{$xmlid}}) {
+				print $detailed_reverse_channels->{$channel_xmlid_to_opt_channel_xmlid{$xmlid}};
+			} else {
+				print $detailed_reverse_channels->{$xmlid} . "HD";
+			}
+			print "' with xmlid '$channel_xmlid_to_opt_channel_xmlid{$xmlid}'" .
+					" augmented with programs from channel '$argument'\n";
+
+			if (defined $ar->{$argument}) {
+				@aprogs = sort {$a <=> $b} keys %{$ar->{$argument}};
+				$aprog = $ar->{$argument}->{shift @aprogs};
+			}
+		}
+
+		# loop over this channels programs, inserting argument programs as needed
+		my @progs = sort {$a <=> $b} keys %{$hd->{$xmlid}};
+		my $prog = $hd->{$xmlid}->{shift @progs};
+		while (defined $prog) {
+
+			# insert argument programs if they start before other programs stop
+			while (defined $aprog && defined $prog &&
+						Shepherd::Common::parse_xmltv_date($aprog->{start}) <
+					 	Shepherd::Common::parse_xmltv_date($prog->{stop})) {
+				$aprog->{channel} = $channel_xmlid_to_opt_channel_xmlid{$xmlid};
+				&gapfill($aprog->{channel}, $aprog->{start}, $aprog->{stop});
+				$writer->write_programme($aprog);
+				$stats{wrote_prog_into_hdtv_channel}++;
+
+				# drop programs that conflict with argument program
+				while (defined $prog && Shepherd::Common::parse_xmltv_date($prog->{start}) <
+						Shepherd::Common::parse_xmltv_date($aprog->{stop})) {
+					$prog = $hd->{$xmlid}->{shift @progs};
+				}
+
+				$aprog = $ar->{$argument}->{shift @aprogs};
+			}
+			last if !defined $prog;
+
+			&gapfill($prog->{channel}, $prog->{start}, $prog->{stop});
+			$writer->write_programme($prog);
+			$stats{wrote_prog_into_hdtv_channel}++;
+
+			$prog = $hd->{$xmlid}->{shift @progs};
+		}
+
+		# write any left over argument programs
+		while (defined $aprog) {
+			$aprog->{channel} = $channel_xmlid_to_opt_channel_xmlid{$xmlid};
+			&gapfill($aprog->{channel}, $aprog->{start}, $aprog->{stop});
+			$writer->write_programme($aprog);
+			$stats{wrote_prog_into_hdtv_channel}++;
+
+			$aprog = $ar->{$argument}->{shift @aprogs};
+		}
+	}
+}
+
+sub gapfill
+{
+	my $prog;
+	$prog->{channel} = shift;
+	$prog->{start} = $gaplaststop;
+	$prog->{stop} = shift;
+	$gaplaststop = shift;
+
+	if (defined $prog->{start} && defined $gapchannel && $gapchannel eq $prog->{channel}) {
+		if (Shepherd::Common::parse_xmltv_date($prog->{start}) !=
+				Shepherd::Common::parse_xmltv_date($prog->{stop})) {
+			if ($opt->{action} eq "copysd") {
+				$prog->{title}->[0]->[0] = "Gap";
+			} else {
+				$prog->{title}->[0]->[0] = "Upscaled SD or Loop";
+				$prog->{desc}->[0]->[0] =
+						"This can be populated with programs by changing your Shepherd settings.";
+			}
+			$writer->write_programme($prog);
+			$stats{wrote_gapfill_into_hdtv_channel}++;
+		}
+	} else {
+		$gapchannel = $prog->{channel};
+	}
+}
+
+######################################################################################################
+
+sub canonicalizeTitle
+{
+	my $title=shift;
+	$title =~ s/^\s+//;
+	$title =~ s/\s+$//;
+	$title =~ s/&(#(\d+)|(.*?));/ $2 ? chr($2) : $amp{$3}||' ' /eg;
+	$title =~ s/ *\& */ and /g;
+	$title =~ s/[^ a-zA-Z0-9]//g;
+	$title =~ s/\s+/ /;
+	return(lc($title));
+}
+
+my %alternatives = ( one => "1",
+		     two => "2",
+		     to  => "2",
+		     too => "2",
+		     three => "3",
+		     four => "4",
+		     for => "4",
+		     five => "5",
+		     six => "6",
+		     seven => "7",
+		     eight => "8",
+		     nine => "9"
+		   );
+
+sub forgivingMatch
+{
+	my $word1 = shift;
+	my $word2 = shift;
+
+	# exact match
+	return 1 if $word1 eq $word2;
+	# they match according to our alternatives lookup table
+	return 1 if $alternatives{$word1} && $alternatives{$word1} eq $word2 ||
+		    $alternatives{$word2} && $alternatives{$word2} eq $word1;
+	# irreconcilable differences
+	return 0 if abs(length($word1) - length($word2)) > 1 ||
+		    length($word1) < 3;
+
+	my @list1 = split(//,$word1);
+	my @list2 = split(//,$word2);
+	my $i = 0;
+	my $j = 0;
+
+	# find first difference
+	while ($i < @list1 && $j < @list2 && $list1[$i] eq $list2[$j]) {
+		++$i; ++$j;
+	}
+	if ($i+1 < @list1 && $j+1 < @list2) {
+		# at least 2 chars to go in both words
+		if ($list1[$i+1] eq $list2[$j] && $list1[$i] eq $list2[$j+1]) {
+			# characters transposed
+			$i += 2;
+			$j += 2;
+		} elsif ($list1[$i+1] eq $list2[$j]) {
+			# extra character inserted into @list1
+			$i += 2;
+			++$j;
+		} elsif ($list1[$i] eq $list2[$j+1]) {
+			# extra character inserted into @list2
+			++$i;
+			$j += 2;
+		} else {
+			# single character difference
+			++$i;
+			++$j;
+		}
+		# we forgave one difference; now do rest of strings match exactly?
+		while ($i < @list1 && $j < @list2 && $list1[$i] eq $list2[$j]) {
+			++$i; ++$j;
+		}
+		return($i == @list1 && $j == @list2);
+	} elsif ($i == @list1 || $j == @list2) {
+		# only difference is one word has one extra letter, or last char
+		# of each word differ.  That's still only one one-char difference
+		return(1);
+	}
+}
+
+sub canonicalizeTitles_match
+{
+	my $word1=canonicalizeTitle(shift);
+	my $word2 =canonicalizeTitle(shift);
+	my @longer;
+	my @shorter;
+
+	if (length($word1) > length($word2)) {
+		@longer  = split(/\s+/, $word1);
+		@shorter = split(/\s+/, $word2);
+	} else {
+		@shorter = split(/\s+/, $word1);
+		@longer  = split(/\s+/, $word2);
+	}
+
+	WORD: for my $word (@shorter) {
+		for(my $i=0; $i < @longer; ++$i) {
+			if (forgivingMatch($longer[$i], $word)) {
+				splice(@longer,$i,1);
+				next WORD;
+			} elsif ($i+1 < @longer &&
+				 $word eq "$longer[$i]$longer[$i+1]") {
+				splice(@longer,$i,2);
+				next WORD;
+			}
+		}
+		return(0);
+	}
+	return(1);
+}
+
+##############################################################################
