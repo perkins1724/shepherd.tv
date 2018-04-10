@@ -10,6 +10,8 @@
 # fetch mechanisms we also assume the input data is already processed for
 # UTF8 so that has been removed too.
 
+my $version = '0.2';
+
 package JSON::cut_down_PP;
 
 use 5.005;

@@ -2,7 +2,7 @@ application	shepherd	1.9.12
 references	channel_list	140
 reference	Shepherd/Common.pm	1.30
 reference	Shepherd/Configure.pm	0.41
-reference	Shepherd/json_pp.pm	
+reference	Shepherd/json_pp.pm	0.2
 reference	Shepherd/MythTV.pm	0.42
 grabber	foxtel_swf	5.02
 grabber	oztivo	2.62
