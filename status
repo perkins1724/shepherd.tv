@@ -1,5 +1,5 @@
 application	shepherd	1.9.12
-references	channel_list	140
+reference	channel_list	140
 reference	Shepherd/Common.pm	1.30
 reference	Shepherd/Configure.pm	0.41
 reference	Shepherd/json_pp.pm	0.2
