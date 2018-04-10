@@ -1910,7 +1910,7 @@ sub read_config_file
 	# Components with no source are assigned to github
 	foreach (keys %$components)
 	{
-	    $components->{$_}->{source} ||= 'https://raw.githubusercontent.com/perkins1724/shepherd.tv/master/';
+	    $components->{$_}->{source} ||= 'https://raw.githubusercontent.com/perkins1724/shepherd.tv/working/';
 	}
     }
 	
@@ -2326,7 +2326,7 @@ sub delsource
 
 sub reset_sources
 {
-    $sources = [ 'https://raw.githubusercontent.com/perkins1724/shepherd.tv/master/' ];
+    $sources = [ 'https://raw.githubusercontent.com/perkins1724/shepherd.tv/working/' ];
 }
 
 sub list_chan_names
