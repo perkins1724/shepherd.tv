@@ -1,17 +1,16 @@
-application     shepherd            1.9.11
-reference       channel_list        129
-reference       Shepherd/Common.pm  1.30
-reference       Shepherd/MythTV.pm  0.42
-reference       Shepherd/Configure.pm   0.41
-reference	Shepherd/json_pp.pm 0.2
-grabber         oztivo              2.62
-grabber         yahoo7widget        2.44
-grabber         sbsweb              5.04
-grabber         rex                 10.3.2
-grabber         foxtel_swf          5.00
-reconciler      reconciler_mk2      0.58
-postprocessor   augment_timezone    0.30
-postprocessor	add_channel_icons   0.2
-postprocessor   tmdb_augment_data  2.5
-postprocessor   ttvdb_augment_data 1.2
-END
+application	shepherd	1.9.12
+reference	channel_list	144
+reference	Shepherd/Common.pm	1.30
+reference	Shepherd/Configure.pm	0.41
+reference	Shepherd/json_pp.pm	
+reference	Shepherd/MythTV.pm	0.42
+grabber	foxtel_swf	5.02
+grabber	oztivo	2.62
+grabber	rex	10.4.11
+grabber	sbsweb	5.04
+grabber	yahoo7widget	2.45
+reconciler	reconciler_mk2	0.58
+postprocessor	add_channel_icons	0.2
+postprocessor	augment_timezone	0.30
+postprocessor	tmdb_augment_data	2.5
+postprocessor	ttvdb_augment_data	1.2
