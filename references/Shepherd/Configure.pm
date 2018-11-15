@@ -1,7 +1,7 @@
 
 package Shepherd::Configure;
 
-my $version = '0.41';
+my $version = '0.42';
 
 use strict;
 no strict 'refs';
@@ -1333,6 +1333,10 @@ sub munge
     # Make HDTV equivalent to HD
 
     $ret =~s/HDTV/HD/g;
+
+    # Remove subsequent occurances of ABC.
+
+    $ret =~s/ABC//2g;
 
     # Remove any non alphabetics.
 
