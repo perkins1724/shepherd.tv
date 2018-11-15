@@ -1,7 +1,7 @@
 
 package Shepherd::Configure;
 
-my $version = '0.43';
+my $version = '0.44';
 
 use strict;
 no strict 'refs';
@@ -1336,7 +1336,9 @@ sub munge
 
     # Remove subsequent occurances of ABC.
 
-    $ret =~s/ABC//2;
+    $ret =~s/ABC/ZZZ/;
+    $ret =~s/ABC//g;
+    $ret =~s/ZZZ/ABC/;
 
     # Remove any non alphabetics.
 
